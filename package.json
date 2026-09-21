@@ -1,0 +1,41 @@
+{
+  "name": "joinfs-gpx2jfs-converter-webcomponent",
+  "version": "0.1.0",
+  "description": "Web component that converts GPX tracklogs into JoinFS recordings (.jfs) in the browser, including gear, flaps and lights.",
+  "keywords": [
+    "joinfs",
+    "gpx",
+    "jfs",
+    "flight-simulator",
+    "msfs",
+    "web-component",
+    "custom-element"
+  ],
+  "license": "CC-BY-NC-SA-4.0",
+  "private": true,
+  "main": "src/joinfs-gpx-to-jfs.js",
+  "files": [
+    "src",
+    "LICENSE",
+    "NOTICE.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "scripts": {
+    "test": "node test/run.js",
+    "test:browser": "node test/run.js --browser",
+    "test:all": "node test/run.js --all",
+    "sample": "node tools/make-sample-gpx.js",
+    "screenshots": "node tools/make-screenshots.js"
+  },
+  "devDependencies": {
+    "@xmldom/xmldom": "^0.9.12",
+    "jsdom": "^30.1.0"
+  },
+  "optionalDependencies": {
+    "@sparticuz/chromium": "^153.0.0",
+    "puppeteer-core": "^25.11.0"
+  }
+}

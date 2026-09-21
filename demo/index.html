@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>joinfs-gpx-to-jfs demo</title>
+<style>
+  :root{color-scheme:light dark;--bg:#f4eff4;--fg:#1d1b20;--muted:#49454f;--link:#6750a4;--code:#e7e0ec}
+  @media (prefers-color-scheme:dark){:root{--bg:#0f0d13;--fg:#e6e0e9;--muted:#cac4d0;--link:#d0bcff;--code:#2b2930}}
+  body{margin:0;padding:1.5rem 1rem 3rem;background:var(--bg);color:var(--fg);font:16px/1.5 Roboto,system-ui,-apple-system,"Segoe UI",sans-serif}
+  main{max-width:34rem;margin:0 auto}
+  h1{font-size:1.5rem;font-weight:400;margin:0 0 .25rem}
+  h2{font-size:1rem;margin:2rem 0 .5rem}
+  p,li{color:var(--muted);font-size:.9375rem}
+  ul{padding-left:1.25rem}
+  a{color:var(--link)}
+  code,pre{font:.8125rem/1.5 ui-monospace,Consolas,monospace;background:var(--code);color:var(--fg);border-radius:6px}
+  code{padding:.1rem .3rem}
+  pre{padding:.75rem 1rem;overflow-x:auto}
+  joinfs-gpx-to-jfs{margin-top:1.25rem}
+</style>
+
+<main>
+  <h1>joinfs-gpx-to-jfs</h1>
+  <p>Convert a GPX tracklog into a JoinFS recording (<code>.jfs</code>) &ndash; everything happens in your browser.
+    No GPX at hand? <a href="sample-track.gpx" download>Download a synthetic sample flight</a> and drop it below.</p>
+
+  <!-- The component. Without attributes all settings are editable and remembered in the browser. -->
+  <joinfs-gpx-to-jfs></joinfs-gpx-to-jfs>
+
+  <h2>Try these variants</h2>
+  <ul>
+    <li><a href="?icao=C172&amp;callsign=ASGX&amp;model=Cessna%20172%20Wheels">Aircraft preset via URL</a>
+      &ndash; the three aircraft fields disappear</li>
+    <li><a href="?icao=C172&amp;callsign=ASGX&amp;model=Cessna%20172%20Wheels&amp;livery=&amp;nickname=&amp;build=fs2024">Everything preset</a>
+      &ndash; no fields at all, converts as soon as a file is dropped</li>
+    <li><a href="?lang=de">Force German</a> (default: the browser's preferred languages, English as fallback)</li>
+    <li><a href="index.html">Back to the default view</a></li>
+  </ul>
+  <p>Language files are loaded from the folder of <code>joinfs-gpx-to-jfs.js</code>, so this needs to be served over
+    http(s); opened straight from disk it stays English. The colour scheme follows your browser setting.</p>
+
+  <h2>Embed it</h2>
+<pre>&lt;joinfs-gpx-to-jfs&gt;&lt;/joinfs-gpx-to-jfs&gt;
+
+&lt;!-- preset values (fields hidden) --&gt;
+&lt;joinfs-gpx-to-jfs icao-type="C172" callsign="ASGX" model="Cessna 172 Wheels"&gt;&lt;/joinfs-gpx-to-jfs&gt;
+
+&lt;script src="joinfs-gpx-to-jfs.js"&gt;&lt;/script&gt;</pre>
+</main>
+
+<script src="../src/joinfs-gpx-to-jfs.js"></script>
+</html>
