@@ -68,7 +68,7 @@ test('upload, convert and download in a real browser (worker path)', async (t) =
     return { name: a.getAttribute('download'), size: buf.byteLength, version: dv.getInt16(0, true), aircraft: dv.getInt32(2, true), focused: s.activeElement === a, text: s.getElementById('out').textContent };
   });
   assert.equal(r.name, 'sample-track.jfs');
-  assert.equal(r.version, 21005);
+  assert.equal(r.version, 21008, 'the layout with the ICAO strings and the static-CG field');
   assert.equal(r.aircraft, 1);
   assert.ok(r.size > 500000, 'size ' + r.size);
   assert.ok(r.focused, 'download link is focused');

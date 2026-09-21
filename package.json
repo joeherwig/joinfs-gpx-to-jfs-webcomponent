@@ -28,7 +28,8 @@
     "test:browser": "node test/run.js --browser",
     "test:all": "node test/run.js --all",
     "sample": "node tools/make-sample-gpx.js",
-    "screenshots": "node tools/make-screenshots.js"
+    "screenshots": "node tools/make-screenshots.js",
+    "track-noise": "node tools/track-noise.js"
   },
   "devDependencies": {
     "@xmldom/xmldom": "^0.9.12",

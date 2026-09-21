@@ -86,10 +86,19 @@ test('file layout', async (t) => {
       assert.equal(d.aircraft[0].icaoType, undefined);
     }
   });
-  await t.test('version 21008 adds the static-CG field (NaN = unknown)', () => {
+  await t.test('version 21008 carries the static-CG field, unknown by default', () => {
+    // NaN, not 0: a GPX cannot say how far the recorded aircraft's datum sat above its wheels, and JoinFS reads
+    // a declared 0 as "sits flush on the ground" and adds the substitute model's whole clearance on top of every
+    // altitude - which is its documented "hovers meters above the ground" bug. Unknown makes it skip that.
     const d = decode(conv(pts, { ...base, jfsVersion: 21008 }).data);
     assert.ok(d.complete);
     assert.ok(Number.isNaN(d.aircraft[0].positions[0].staticCgToGround));
+
+    const m = decode(conv(pts, { ...base, jfsVersion: 21008, groundClearanceM: 1.2 }).data);
+    assert.ok(Math.abs(m.aircraft[0].positions[0].staticCgToGround * 0.3048 - 1.2) < 1e-4, 'metres are written as feet');
+
+    assert.equal(decode(conv(pts, { ...base, jfsVersion: 21005 }).data).aircraft[0].positions[0].staticCgToGround, undefined,
+      'older layouts have no such field');
   });
   await t.test('frame count and timing follow the frame rate', () => {
     for (const hz of [5, 10, 20]) {
@@ -176,7 +185,9 @@ test('gaps in the track', async (t) => {
     const pos = decode(conv([P(0, 50, 10), P(300, 50.00001, 10), P(301, 50.00002, 10), P(302, 50.00003, 10)], OFF).data).aircraft[0].positions;
     const at = (s) => pos[Math.round(s * 5)];
     assert.ok(Math.abs(deg(at(150).lat) - 50) < 1e-7, 'still at the first point halfway through the gap');
-    assert.ok(Math.abs(deg(at(299).lat) - 50) < 2e-6);
+    // Position smoothing is centred, so it sees the movement coming: the aircraft creeps by a fraction of a
+    // metre over the half-window before it actually moves. 5e-6 deg is about half a metre.
+    assert.ok(Math.abs(deg(at(299).lat) - 50) < 5e-6, 'barely moved one second before the track does');
   });
   await t.test('a long gap with movement (signal loss) is bridged in a straight line', () => {
     const pos = decode(conv([P(0, 50, 10, 500), P(1, 50.0001, 10, 500), P(121, 50.05, 10, 700), P(122, 50.0501, 10, 700)], OFF).data).aircraft[0].positions;
@@ -202,7 +213,8 @@ test('gear, flaps and lights', async (t) => {
     const S = info.systems;
     assert.ok(S.liftoffS > 100 && S.touchdownS > S.liftoffS + 500, JSON.stringify(S));
     assert.deepEqual(vals(series(a, VU.gear)), [1, 0, 1]);
-    assert.deepEqual(flapsPct(series(a, VU.flaps)), [15, 0, 100, 0]);
+    // takeoff setting, up after the climb, then staged back down on the approach, up again when clear
+    assert.deepEqual(flapsPct(series(a, VU.flaps)), [20, 0, 33, 67, 100, 0]);
     assert.deepEqual(vals(series(a, VU.strobe)), [0, 1, 0]);
     assert.deepEqual(vals(series(a, VU.nav)), [1]);
     assert.deepEqual(vals(series(a, VU.beacon)), [1]);
@@ -210,8 +222,10 @@ test('gear, flaps and lights', async (t) => {
     assert.deepEqual(vals(series(a, VU.landing)), [0, 1, 0], 'on for the roll, whole flight stays below 4000 ft, off after vacating');
     const g = series(a, VU.gear), f = series(a, VU.flaps);
     assert.equal(g[1][0], f[1][0], 'gear goes up together with the takeoff flaps');
-    assert.ok(g[2][0] < f[2][0], 'gear comes down before the flaps');
-    assert.ok(f[3][0] > S.touchdownS && Math.abs(f[3][0] - S.vacatedS) < 0.01, 'flaps come up when the runway is vacated');
+    const full = f.find((x) => Math.round(x[1] * 100) === 100), last = f[f.length - 1];
+    assert.ok(g[2][0] < full[0], 'gear comes down before full flaps');
+    assert.ok(f[2][0] < g[2][0], 'the first approach flap stage comes before the gear');
+    assert.ok(last[0] > S.touchdownS && Math.abs(last[0] - S.vacatedS) < 0.01, 'flaps come up when the runway is vacated');
   });
 
   await t.test('lights bit mask is consistent with the per-bit variables', () => {
@@ -295,17 +309,18 @@ test('gear, flaps and lights', async (t) => {
     const S = info.systems, n = pts.length;
     const spd = (i) => (dArr[Math.min(n - 1, i + 1)] - dArr[Math.max(0, i - 1)]) / (Math.min(n - 1, i + 1) - Math.max(0, i - 1)) / KT;
     const vTd = spd(td);
+    const NEAR = J.DEFAULTS.flapsLandingNearNm, FAR = J.DEFAULTS.flapsLandingFarNm;
     let and = -1, or = -1;
     for (let i = 140; i < td; i++) {
       const dn = (dArr[td] - dArr[i]) / NM, v = spd(i);
-      if (and < 0 && v <= vTd + 20 && dn <= (v < 100 ? 3 : 7)) and = i;
-      if (or < 0 && (v <= vTd + 10 || (v < 100 ? dn <= 3 : dn <= 7))) or = i;
+      if (and < 0 && v <= vTd + 20 && dn <= (v < 100 ? NEAR : FAR)) and = i;
+      if (or < 0 && (v <= vTd + 10 || (v < 100 ? dn <= NEAR : dn <= FAR))) or = i;
     }
     assert.ok(or < and - 100, 'scenario separates AND from OR (' + or + ' vs ' + and + ')');
     // touchdown is detected 8 m above the ground, i.e. slightly early, hence the tolerance
     assert.ok(Math.abs(S.flapsFullS - and) <= 12, `flaps full at ${S.flapsFullS} s, AND-rule says ${and} s`);
     const nmAtFull = (dArr[td] - dArr[Math.round(S.flapsFullS)]) / NM;
-    assert.ok(nmAtFull > 2.6 && nmAtFull < 3.4, 'about 3 nm from touchdown: ' + nmAtFull.toFixed(2));
+    assert.ok(Math.abs(nmAtFull - NEAR) < 0.4, `about ${NEAR} nm from touchdown: ` + nmAtFull.toFixed(2));
     const nmAtGear = (dArr[td] - dArr[Math.round(S.gearDownS)]) / NM;
     assert.ok(Math.abs((nmAtGear - nmAtFull) - 1) < 0.2, 'gear 1 nm before the flaps: ' + (nmAtGear - nmAtFull).toFixed(2));
   });
@@ -325,8 +340,12 @@ test('gear, flaps and lights', async (t) => {
     const off = run(pts, { systems: 'off' });
     assert.equal(off.a.vars.length, 0);
     assert.equal(off.info.systems, null);
-    const custom = run(pts, { flapsTakeoff: 0.3, flapsLanding: 0.8 });
-    assert.deepEqual(flapsPct(series(custom.a, VU.flaps)), [30, 0, 80, 0]);
+    // the landing stages are fractions of flapsLanding, so they scale with it
+    const custom = run(pts, { flapsTakeoff: 0.3, flapsLanding: 0.9 });
+    assert.deepEqual(flapsPct(series(custom.a, VU.flaps)), [30, 0, 30, 60, 90, 0]);
+    // and an empty stage list restores the single movement straight to full
+    const oneGo = run(pts, { flapsLandingSteps: [] });
+    assert.deepEqual(flapsPct(series(oneGo.a, VU.flaps)), [20, 0, 100, 0]);
     const late = run(pts, { flapsUpAfterLandingKt: 1000 });
     assert.ok(late.info.systems.vacatedS < run(pts).info.systems.vacatedS + 1e-9);
   });
@@ -345,7 +364,7 @@ test('gear, flaps and lights', async (t) => {
   });
 });
 
-const SNAPSHOT_SHA256 = '910b89741752dde1aa2322dd51963b18845857d66cacfe15e3ce95fa60336f4f';
+const SNAPSHOT_SHA256 = '4a1dc1b21d62d3f6129b19e7e3085ad82102c28435f9caa474abca565d874faa';
 
 test('asynchronous conversion (worker path)', async (t) => {
   const text = toGpx(patternFlight());

@@ -41,12 +41,60 @@
     const DEFAULTS = {
       hz: 5, model: 'Cessna 172 Wheels', typerole: 0, callsign: 'ASGX', nickname: '',
       pitchTrimDeg: 2, maxBankDeg: 45, groundAglM: 8, groundMaxKt: 90, gapS: 30, smoothS: 3,
-      jfsVersion: 21005, fs2024: true, icaoType: 'C172', icaoAirline: '', livery: '', maxPoints: 200000,
+      // Height above the field at which the aircraft is taken to be in contact with it. groundAglM above is a
+      // generous threshold for deciding which *phase* of the flight a sample belongs to, and has to be, or GPS
+      // noise would make that phase flicker. It must not be what goes into SIM ON GROUND: JoinFS forwards that
+      // bit to the simulator, which then places the aircraft on the terrain itself and disregards the altitude
+      // in the recording. With the phase threshold there, the aircraft stays pinned to the runway through the
+      // first 8 m of the climb and is let go with a jump, and on approach it is put down 8 m early. This
+      // tighter figure trims each ground stretch back to where the wheels actually are.
+      groundContactM: 1.0,
+      // Shifts every written altitude (and the ground reference with it, so AGL and the on-ground detection are
+      // unchanged). A GPX carries whatever elevation datum its recorder used, which need not agree with the
+      // simulator's terrain mesh; the difference shows up as an aircraft that sits above or below the ground.
+      altitudeOffsetM: 0,
+      // Low-pass the resampled track itself, in seconds; 0 disables it. The resampler interpolates *through* every
+      // source point (cubic Hermite with Catmull-Rom tangents), so GPS noise is not averaged out but amplified:
+      // each tangent is a difference of neighbouring points, and the spline overshoots between them. On a real
+      // 1 Hz tracklog that produces a speed oscillation of several knots at about half the source sample rate,
+      // which the simulator follows, because it drives the injected object from the velocity in this file. The
+      // result is an aircraft that visibly surges fore and aft. Smoothing the positions removes it at the source;
+      // the written velocity, being their derivative, becomes smooth with them. Costs path fidelity: the default
+      // shifts the flown path by up to ~2 m on a noisy track, well inside its own GPS noise, but it also rounds
+      // off genuinely sharp inputs such as a landing flare. Use tools/track-noise.js to pick a value for a
+      // particular track.
+      smoothPosS: 3,
+      // Seconds over which pitch and bank fade between their on-ground value (level) and the value derived from
+      // the track. Without it the attitude snaps by several degrees in a single frame the moment the on-ground
+      // flag flips - at rotation, at touchdown, and repeatedly if the flag chatters near its threshold.
+      groundBlendS: 2,
+      // STATIC CG TO GROUND, in metres, written in file version 21008 and up: how far the recorded altitude sits
+      // above the point where the wheels touch. A GPX does not say - it carries a receiver somewhere in a cabin,
+      // not an aircraft geometry - so the default is null, written as NaN, which JoinFS reads as "unknown" and
+      // skips its ground-clearance correction rather than guessing.
+      //
+      // Do NOT default this to 0. JoinFS cannot tell a declared 0 from an aircraft that genuinely sits flush on
+      // the ground, so it adds the *substitute* model's full clearance on top of every altitude - the JoinFS
+      // source names that as the cause of its "hovers meters above the ground" bug, and it does exactly that
+      // here: the injected aircraft floats by however much the spawned model's gear is deep. Set it only when
+      // the real figure for the recorded aircraft is known.
+      groundClearanceM: null,
+      jfsVersion: 21008, fs2024: true, icaoType: 'C172', icaoAirline: '', livery: '', maxPoints: 200000,
       // Aircraft systems (gear, flaps, lights) derived from the track. systems: 'full' | 'off'
       systems: 'full',
-      flapsTakeoff: 0.15, flapsLanding: 1.0,                      // FLAPS HANDLE PERCENT (0..1)
+      flapsTakeoff: 0.2, flapsLanding: 1.0,                       // FLAPS HANDLE PERCENT (0..1)
+      // Landing flaps come out in stages rather than in one movement, each stage triggered by airspeed: how far
+      // the aircraft still is above its own touchdown speed, which is what a pilot actually flies to and which
+      // scales itself to the aeroplane. Entries are [knots above touchdown speed, fraction of flapsLanding],
+      // earliest first; the last stage is always full flaps at flapsLandingVtdMarginKt. Each stage still has to
+      // pass the same distance-to-touchdown gate as full flaps, so slowing down en route does not lower them.
+      // [] restores the single movement straight to full.
+      flapsLandingSteps: [[40, 1 / 3], [30, 2 / 3]],
+      // Shortest time between two flap movements. An aircraft that decelerates quickly meets several of the
+      // speed thresholds within a second or two, which would read as one jump rather than a staged extension.
+      flapsStageMinS: 20,
       flapsRetractAltFt: 200, flapsRetractFastAltFt: 1000, flapsRetractSpeedKt: 140,
-      flapsLandingNearNm: 3, flapsLandingFarNm: 7, flapsLandingSpeedKt: 100, flapsLandingVtdMarginKt: 20,
+      flapsLandingNearNm: 1.5, flapsLandingFarNm: 7, flapsLandingSpeedKt: 100, flapsLandingVtdMarginKt: 20,
       gearDownBeforeFlapsNm: 1, flapsUpAfterLandingKt: 30,
       lightLandingBelowFt: 4000, lightLandingHysteresisFt: 300, taxiMinKt: 3,
       groundDebounceS: 5, systemsRefreshS: 5,
@@ -87,6 +135,24 @@
       for (let i = 0; i < L; i++) {
         const a = Math.max(0, i - h), b = Math.min(L, i + h + 1);
         out[i] = (pre[b] - pre[a]) / (b - a);
+      }
+      return out;
+    }
+
+    // Same, but the window stays centred: near the ends it shrinks on both sides instead of reaching only
+    // inwards. For a steadily advancing quantity - a position - a one-sided window is not a smoother but a
+    // displacement, pulling the first and last frames along the track by roughly (window / 4) * speed, which is
+    // tens of metres for a few seconds of window at cruise. Shrinking symmetrically fades the smoothing out at
+    // the ends rather than biasing them, at the cost of leaving the very first and last samples untouched.
+    function movingAvgCentred(x, n) {
+      if (n <= 1) return x.slice();
+      const h = Math.floor(n / 2);
+      const pre = [0];
+      for (const v of x) pre.push(pre[pre.length - 1] + v);
+      const L = x.length, out = new Array(L);
+      for (let i = 0; i < L; i++) {
+        const w = Math.min(h, i, L - 1 - i);
+        out[i] = (pre[i + w + 1] - pre[i - w]) / (2 * w + 1);
       }
       return out;
     }
@@ -165,9 +231,11 @@
     function derive(grid, o, prog) {
       const n = grid.length, dt = 1 / o.hz;
       const t = grid.map((g) => g[0]);
-      const lat = grid.map((g) => rad(g[1]));
-      const lon = grid.map((g) => rad(g[2]));
-      const alt = grid.map((g) => g[3]);
+      const posWin = Math.max(1, Math.trunc(o.smoothPosS * o.hz)) | 1;
+      const sm = (a) => (posWin > 1 ? movingAvgCentred(a, posWin) : a);
+      const lat = sm(grid.map((g) => rad(g[1])));
+      const lon = sm(grid.map((g) => rad(g[2])));
+      const alt = sm(grid.map((g) => g[3] + o.altitudeOffsetM));
 
       const kx = lat.map((la) => R_EARTH * Math.cos(la));
       const E = new Array(n).fill(0), N = new Array(n).fill(0);
@@ -183,6 +251,13 @@
         }
         return out;
       };
+      // Two velocities, deliberately. vE/vN/vU is the plain derivative of the positions that get written, and it
+      // is what goes into the file: the simulator drives the injected object from this field (zero it and the
+      // aircraft drops out of the sky), so it has to be both accurate and smooth. It is smooth because the
+      // positions it differentiates were denoised by smoothPosS, not because of any filter of its own - filtering
+      // it separately only makes it disagree with its own positions. The smoothS-filtered vEs/vNs/vUs stay behind
+      // for everything *derived*: heading, pitch, bank and the gear/flaps/lights rules, which want a steady signal
+      // and are not required to agree with the position derivative.
       const vE = diff(E), vN = diff(N), vU = diff(alt);
       const win = Math.max(1, Math.trunc(o.smoothS * o.hz)) | 1;
       const vEs = movingAvg(vE, win), vNs = movingAvg(vN, win), vUs = movingAvg(vU, win);
@@ -206,23 +281,79 @@
       const bankRight = gs.map((g, i) => Math.max(-maxB, Math.min(maxB, Math.atan2(g * rate[i], G))));
       if (prog) prog(0.8);
 
-      // ground state: near start/end elevation and not too fast
-      const refStart = alt[0], refEnd = alt[n - 1], mid = Math.floor(n / 2);
+      // Ground state, and the ground reference written as GROUND ALTITUDE.
+      //
+      // Two passes, because the two depend on each other. A provisional reference walking from the departure
+      // altitude to the arrival one decides who is on the ground; then the reference is rebuilt to follow the
+      // ground the aircraft is actually on: while it is down, the ground is exactly where the aircraft is, so
+      // the reference *is* its altitude, and the airborne stretch in between is interpolated from the last
+      // altitude on the ground to the next one. A single ramp across the whole flight cannot do that - an
+      // airfield a few metres off the straight line between the first and last fix (a hill between two strips,
+      // a parking spot below the runway) put that error straight into the written height above ground, and
+      // JoinFS blends its own terrain reading against ours at full weight whenever height is near zero. That is
+      // felt as the aircraft being heaved up or pushed down over the first hundred metres of the climb.
+      const provisional = (i) => (n < 2 ? alt[0] : alt[0] + (alt[n - 1] - alt[0]) * (i / (n - 1)));
+      const onGround = new Array(n);
+      for (let i = 0; i < n; i++) onGround[i] = ((alt[i] - provisional(i)) <= o.groundAglM && gs[i] < o.groundMaxKt * KT) ? 0 : 1;
+
+      // Each unbroken stretch on the ground gets one field elevation, a low percentile of the altitudes in it
+      // rather than the altitude of its last sample: the on-ground flag only lets go at groundAglM, so that last
+      // sample is already that far up and taking it would put the whole airborne reference - and with it every
+      // height JoinFS computes on approach - the same distance too high. A percentile rather than the minimum so
+      // one low GPS outlier cannot define an airfield.
+      const groundRef = new Array(n);
+      const stretches = [];
+      for (let i = 0; i < n; i++) {
+        if (onGround[i] !== 0) continue;
+        const last = stretches[stretches.length - 1];
+        if (last && last.end === i - 1) last.end = i;
+        else stretches.push({ start: i, end: i });
+      }
+      for (const s of stretches) {
+        const a = alt.slice(s.start, s.end + 1).sort((x, y) => x - y);
+        s.elev = a[Math.trunc(a.length * 0.1)];
+      }
+      if (stretches.length === 0) {
+        for (let i = 0; i < n; i++) groundRef[i] = provisional(i);
+      } else {
+        for (const s of stretches) for (let i = s.start; i <= s.end; i++) groundRef[i] = s.elev;
+        for (let i = 0; i < stretches[0].start; i++) groundRef[i] = stretches[0].elev;
+        for (let i = stretches[stretches.length - 1].end + 1; i < n; i++) groundRef[i] = stretches[stretches.length - 1].elev;
+        // airborne: a straight line from the field it left to the field it is going to
+        for (let k = 1; k < stretches.length; k++) {
+          const a = stretches[k - 1], b = stretches[k];
+          for (let i = a.end + 1; i < b.start; i++) {
+            groundRef[i] = a.elev + (b.elev - a.elev) * ((i - a.end) / (b.start - a.end));
+          }
+        }
+      }
+
+      // Trim each ground stretch back to actual contact, now that there is a reference to measure against.
+      // Only samples adjacent to an already-airborne one are reconsidered, and the change propagates inwards
+      // from there, so this can only shorten a stretch from its ends - noise in the middle of a long taxi can
+      // never punch a hole in it.
+      for (let i = n - 2; i >= 0; i--) {
+        if (onGround[i] === 0 && onGround[i + 1] === 1 && alt[i] - groundRef[i] > o.groundContactM) onGround[i] = 1;
+      }
+      for (let i = 1; i < n; i++) {
+        if (onGround[i] === 0 && onGround[i - 1] === 1 && alt[i] - groundRef[i] > o.groundContactM) onGround[i] = 1;
+      }
+
+      // 0 on the ground, 1 airborne, ramped across the transition so the attitude never steps
+      const airborne = movingAvg(onGround, Math.max(1, Math.trunc(o.groundBlendS * o.hz)) | 1);
+
       const samples = new Array(n);
       for (let i = 0; i < n; i++) {
-        const ref = i < mid ? refStart : refEnd;
-        const ground = (alt[i] - ref) <= o.groundAglM && gs[i] < o.groundMaxKt * KT;
-        let pitchUp, bankR;
-        if (ground) { pitchUp = 0; bankR = 0; }
-        else {
-          const fpa = Math.atan2(vUs[i], Math.max(gs[i], 1.0));
-          pitchUp = Math.max(-rad(30), Math.min(rad(30), fpa + rad(o.pitchTrimDeg)));
-          bankR = bankRight[i];
-        }
+        const ref = groundRef[i];
+        const ground = onGround[i] === 0;
+        const fpa = Math.atan2(vUs[i], Math.max(gs[i], 1.0));
+        const w = airborne[i];
+        const pitchUp = w * Math.max(-rad(30), Math.min(rad(30), fpa + rad(o.pitchTrimDeg)));
+        const bankR = w * bankRight[i];
         samples[i] = {
           t: t[i], lat: lat[i], lon: lon[i], alt: alt[i],
           pitch: -pitchUp, bank: -bankR, heading: pmod(heading[i], 2 * Math.PI),
-          vE: vEs[i], vU: vUs[i], vN: vNs[i], gs: gs[i], ground, elevation: ref,
+          vE: vE[i], vU: vU[i], vN: vN[i], gs: gs[i], ground, elevation: ref,
         };
       }
       return samples;
@@ -254,6 +385,7 @@
       if ((o.fs2024 && v >= 21005) || (!o.fs2024 && v >= 21004)) tail.push(stringBytes(o.icaoType), stringBytes(o.icaoAirline));
       const len = (a) => a.reduce((s, x) => s + x.length, 0);
       const frameSize = 96 + (v >= 21008 ? 4 : 0);
+      const cgFt = o.groundClearanceM === null || o.groundClearanceM === undefined ? NaN : o.groundClearanceM / 0.3048;
       const size = 2 + 4 + 1 + len(head) + 1 + 4 + samples.length * frameSize + (sys ? sys.bytes : 0) + len(tail) + 4;
       const buf = new ArrayBuffer(size), dv = new DataView(buf), u8 = new Uint8Array(buf);
       let p = 0;
@@ -277,7 +409,7 @@
         for (let i = 0; i < 5; i++) { dv.setInt16(p, 0, true); p += 2; }   // rudder, elevator, aileron, brakes
         dv.setFloat32(p, s.elevation, true); p += 4;
         dv.setUint8(p, s.ground ? 1 : 0); p += 1;
-        if (v >= 21008) { dv.setFloat32(p, NaN, true); p += 4; }
+        if (v >= 21008) { dv.setFloat32(p, cgFt, true); p += 4; }
         const extra = sys && sys.byIdx.get(k);           // gear/flaps/lights frames share the sample's timestamp
         if (extra) { u8.set(extra, p); p += extra.length; }
       }
@@ -361,18 +493,42 @@
         }
       }
 
-      // landing: flaps full when v <= Vtd+20 kt AND within the distance that matches the speed (3 nm below 100 kt, 7 nm at/above), airborne, along-track distance
+      // Landing flaps: each stage waits until the aircraft has slowed to within `margin` knots of the speed it
+      // will actually touch down at, and until it is close enough that the slowdown can only be the approach
+      // (3 nm below 100 kt, 7 nm at or above). Airborne, measured along track.
       let flapsFull = -1, gearDown = -1, vacated = -1;
+      const flapSteps = [];
       if (touchdown >= 0) {
         const vTd = kt(touchdown);
-        for (let i = Math.max(liftoff + 1, retract >= 0 ? retract + 1 : 0); i < touchdown; i++) {
-          if (stable[i]) continue;
-          const dNm = (cum[touchdown] - cum[i]) / NM;
-          if (dNm > o.flapsLandingFarNm) continue;
-          const v = kt(i);
-          if (v <= vTd + o.flapsLandingVtdMarginKt && dNm <= (v < o.flapsLandingSpeedKt ? o.flapsLandingNearNm : o.flapsLandingFarNm)) { flapsFull = i; break; }
+        const firstAllowed = Math.max(liftoff + 1, retract >= 0 ? retract + 1 : 0);
+        // `nearNm` only tightens the gate once the aircraft is slow: the intermediate stages are allowed further
+        // out, because a first notch belongs on the approach, not on short final where full flaps belong.
+        const findStage = (from, margin, nearNm) => {
+          for (let i = Math.max(from, firstAllowed); i < touchdown; i++) {
+            if (stable[i]) continue;
+            const dNm = (cum[touchdown] - cum[i]) / NM;
+            if (dNm > o.flapsLandingFarNm) continue;
+            const v = kt(i);
+            if (v <= vTd + margin && dNm <= (v < o.flapsLandingSpeedKt ? nearNm : o.flapsLandingFarNm)) return i;
+          }
+          return -1;
+        };
+        // stages on the way down, then full flaps - the margin for which is unchanged
+        const steps = (Array.isArray(o.flapsLandingSteps) ? o.flapsLandingSteps : [])
+          .filter(([margin]) => margin > o.flapsLandingVtdMarginKt)
+          .slice().sort((a, b) => b[0] - a[0]);
+        const gap = Math.max(1, Math.round(o.flapsStageMinS * hz));
+        let from = firstAllowed;
+        for (const [margin, fraction] of steps) {
+          const idx = findStage(from, margin, o.flapsLandingFarNm);
+          if (idx < 0) continue;
+          flapSteps.push({ idx, flaps: o.flapsLanding * fraction });
+          from = idx + gap;
         }
+        flapsFull = findStage(from, o.flapsLandingVtdMarginKt, o.flapsLandingNearNm);
         if (flapsFull < 0) flapsFull = Math.max(touchdown - 1, 0);
+        // a stage that would land on or after full flaps has nothing left to do
+        while (flapSteps.length && flapSteps[flapSteps.length - 1].idx >= flapsFull) flapSteps.pop();
         let j = flapsFull;
         while (j > 0 && cum[flapsFull] - cum[j] < o.gearDownBeforeFlapsNm * NM) j--;
         gearDown = Math.max(j, liftoff + 1);
@@ -418,11 +574,13 @@
         }
       }
       if (gearUp) add(gearDown, { gear: 1 });
+      for (const s of flapSteps) add(s.idx, { flaps: s.flaps });
       if (flapsFull >= 0) add(flapsFull, { flaps: o.flapsLanding });
       if (vacated >= 0) add(vacated, { flaps: 0, strobe: 0, landing: 0, taxi: 1 });
       ev.sort((a, b) => a.idx - b.idx);
       const at = (i) => (i >= 0 ? Math.round((i / hz) * 10) / 10 : null);
       return { initial, ev, marks: { liftoffS: at(liftoff), flapsRetractS: at(retract), flapsFullS: at(flapsFull),
+        flapsStepsS: flapSteps.map((s) => ({ atS: at(s.idx), flaps: s.flaps })),
         gearUpS: gearUp ? at(retract) : null, gearDownS: gearUp ? at(gearDown) : null, touchdownS: at(touchdown), vacatedS: at(vacated) } };
     }
 
@@ -755,7 +913,8 @@
   //   icao-type | ?icao   callsign   model   nickname   build
   //   A valid value PRESETS the setting and hides its input field. Add the boolean attribute `editable`
   //   to keep the fields visible and use the values only as defaults instead.
-  //   typerole   systems       no input field at all - attribute / URL parameter or the default (see HIDDEN)
+  //   typerole  systems  hz  altitude-offset  smooth-pos  ground-clearance
+  //                     no input field at all - attribute / URL parameter or the default (see HIDDEN)
   //   no-url-params   ignore URL parameters          auto-convert   convert as soon as a file is loaded
   //   lang | ?lang    force a UI language            locale-base    folder of the locale files (default: folder of this script)
   //   storage-key     localStorage key (default joinfs-gpx-to-jfs:v1)
@@ -778,11 +937,24 @@
     // matching (see TYPEROLES); `unknown` lets the ICAO type designator do the work. `systems` because deriving
     // gear, flaps and lights is what the converter is for - `off` stays available for the reference writer and as
     // an escape hatch, but it is not a question to put to the user.
-    const HIDDEN = ['typerole', 'systems'];
+    // `hz` is here too: the output frame rate is a property of the file, not something to ask a pilot about, but
+    // 5 Hz is not right for everyone (a 20 Hz recording is four times the frames and four times the size).
+    const HIDDEN = ['typerole', 'systems', 'hz', 'altitudeOffset', 'smoothPos', 'groundClearance'];
     const KEYS = FIELDS.concat(HIDDEN);
     const BASE_DEFAULTS = {
       icaoType: DEFAULTS.icaoType, callsign: DEFAULTS.callsign, model: DEFAULTS.model, livery: '', nickname: '',
-      typerole: 'unknown', systems: 'full', build: 'fs2024',
+      typerole: 'unknown', systems: 'full', build: 'fs2024', hz: String(DEFAULTS.hz),
+      altitudeOffset: String(DEFAULTS.altitudeOffsetM),
+      smoothPos: String(DEFAULTS.smoothPosS),
+      groundClearance: DEFAULTS.groundClearanceM === null ? 'none' : String(DEFAULTS.groundClearanceM),
+    };
+    // A blank attribute is not a value: Number('') is 0, which would silently turn a numeric setting into
+    // "0" rather than leaving it at its default. Reject it before the range check.
+    const num = (lo, hi) => (v) => {
+      v = String(v).trim();
+      if (v === '') return undefined;
+      const n = Number(v);
+      return (Number.isFinite(n) && n >= lo && n <= hi) ? String(n) : undefined;
     };
     // returns a clean value or undefined (= not usable)
     const SANITIZE = {
@@ -795,14 +967,24 @@
       typerole: (v) => (has(TYPEROLES, String(v)) ? String(v) : undefined),
       build: (v) => (BUILDS.includes(String(v)) ? String(v) : undefined),
       systems: (v) => (['full', 'off'].includes(String(v)) ? String(v) : undefined),
+      // 1-30 Hz; the converter still refuses a track that would blow up the frame count (err.tooLong)
+      hz: num(1, 30),
+      // metres, +/- 500: enough for any terrain-datum mismatch, small enough that a typo cannot send a track into orbit
+      altitudeOffset: num(-500, 500),
+      smoothPos: num(0, 10),
+      // 'none' writes NaN: JoinFS then treats the clearance as unknown and makes no ground correction at all
+      groundClearance: (v) => (String(v).trim() === 'none' ? 'none' : num(0, 20)(v)),
     };
     const PARAM_NAMES = {
       icaoType: ['icao', 'icao-type'], callsign: ['callsign'], model: ['model'], livery: ['livery'], nickname: ['nickname'],
-      typerole: ['typerole'], build: ['build'], systems: ['systems'],
+      typerole: ['typerole'], build: ['build'], systems: ['systems'], hz: ['hz'],
+      altitudeOffset: ['altitude-offset', 'alt-offset'],
+      smoothPos: ['smooth-pos'], groundClearance: ['ground-clearance'],
     };
     const ATTR_NAMES = {
       icaoType: 'icao-type', callsign: 'callsign', model: 'model', livery: 'livery', nickname: 'nickname',
-      typerole: 'typerole', build: 'build', systems: 'systems',
+      typerole: 'typerole', build: 'build', systems: 'systems', hz: 'hz', altitudeOffset: 'altitude-offset',
+      smoothPos: 'smooth-pos', groundClearance: 'ground-clearance',
     };
 
     async function fetchLocale(url) {
@@ -1283,9 +1465,13 @@ progress{width:100%;height:4px;margin-top:.5rem;accent-color:var(--_accent)}
             livery: v.livery,
             nickname: v.nickname,
             typerole: TYPEROLES[this._fixed.typerole],
-            jfsVersion: 21005,                       // first file version that carries the ICAO strings
+            jfsVersion: DEFAULTS.jfsVersion,         // 21008: ICAO strings plus the static-CG field
             fs2024: v.build === 'fs2024',
             systems: this._fixed.systems,
+            hz: Number(this._fixed.hz),
+            altitudeOffsetM: Number(this._fixed.altitudeOffset),
+            smoothPosS: Number(this._fixed.smoothPos),
+            groundClearanceM: this._fixed.groundClearance === 'none' ? null : Number(this._fixed.groundClearance),
             ...this.flapOptions(),
           }, { signal: abort.signal, onProgress: (f) => { prog.value = f; } });
           const stem = file.name.replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60) || 'recording';

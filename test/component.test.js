@@ -132,7 +132,7 @@ test('everything preset: no fields, no convert button, converts on load', async 
   assert.ok($(el, 'go').hidden && !$(el, 'reset'));
   const d = await convertViaUi(m, el);
   const got = await blobBytes(m.w, d.blob);
-  const want = core({ icaoType: 'B738', callsign: 'DLH1', model: 'Boeing 737-800', nickname: 'Fritz', typerole: 3, jfsVersion: 21005, fs2024: false, systems: 'full' }).data;
+  const want = core({ icaoType: 'B738', callsign: 'DLH1', model: 'Boeing 737-800', nickname: 'Fritz', typerole: 3, fs2024: false, systems: 'full' }).data;
   assert.ok(same(got, want), 'the blob equals the core output for the same options');
   assert.equal(d.filename, 'Sample_flight.jfs');
 });
@@ -215,15 +215,44 @@ test('settings are remembered in localStorage', async (t) => {
   });
 });
 
-test('the removed frame-rate setting: no field, stale values are ignored and dropped', () => {
+test('frame rate: no field, set by attribute or URL parameter, stale stored values dropped', async () => {
   const m = mount(`<${TAG}></${TAG}>`);
   assert.equal($(m.el(), 'hz'), null, 'there is no frame-rate field');
   m.w.localStorage.setItem(TAG + ':v1', JSON.stringify({ hz: '20', callsign: 'KEEP' }));
   const el = m.w.document.createElement(TAG); m.w.document.body.appendChild(el);
   assert.equal($(el, 'callsign').value, 'KEEP');
   typeInto(m.w, el, 'nick', 'X');
-  assert.ok(!('hz' in JSON.parse(m.w.localStorage.getItem(TAG + ':v1'))));
-  assert.equal(mount(`<${TAG} hz="20"></${TAG}>`, { url: 'https://example.test/?hz=20' }).el().shadowRoot.querySelectorAll('.field:not([hidden])').length, 6, 'attribute and URL parameter hz do nothing');
+  assert.ok(!('hz' in JSON.parse(m.w.localStorage.getItem(TAG + ':v1'))), 'not a remembered setting');
+  assert.equal(mount(`<${TAG} hz="20"></${TAG}>`, { url: 'https://example.test/?hz=20' })
+    .el().shadowRoot.querySelectorAll('.field:not([hidden])').length, 6, 'and it adds no field');
+
+  // default stays 5 Hz
+  let m2 = mount(`<${TAG}></${TAG}>`); let el2 = m2.el();
+  typeInto(m2.w, el2, 'callsign', 'X');
+  let d = await convertViaUi(m2, el2);
+  assert.ok(same(await blobBytes(m2.w, d.blob), core({ callsign: 'X' }).data), 'default is 5 Hz');
+
+  // 20 Hz via the attribute: four times the frames of the 5 Hz default
+  m2 = mount(`<${TAG} hz="20"></${TAG}>`); el2 = m2.el();
+  typeInto(m2.w, el2, 'callsign', 'X');
+  d = await convertViaUi(m2, el2);
+  assert.ok(same(await blobBytes(m2.w, d.blob), core({ callsign: 'X', hz: 20 }).data), 'the attribute reaches the converter');
+  const five = decode(core({ callsign: 'X' }).data, { fs2024: true }).aircraft[0].positions.length;
+  const twenty = decode(core({ callsign: 'X', hz: 20 }).data, { fs2024: true }).aircraft[0].positions.length;
+  assert.ok(twenty > 3.5 * five, `20 Hz gives about four times the position frames (${five} -> ${twenty})`);
+
+  // the URL parameter wins, and an unusable value falls back to the default
+  m2 = mount(`<${TAG} hz="20"></${TAG}>`, { url: 'https://example.test/?hz=10' }); el2 = m2.el();
+  typeInto(m2.w, el2, 'callsign', 'X');
+  d = await convertViaUi(m2, el2);
+  assert.ok(same(await blobBytes(m2.w, d.blob), core({ callsign: 'X', hz: 10 }).data), 'URL parameter wins');
+
+  for (const bad of ['0', '31', 'nope', '']) {
+    const mb = mount(`<${TAG} hz="${bad}"></${TAG}>`); const eb = mb.el();
+    typeInto(mb.w, eb, 'callsign', 'X');
+    const db = await convertViaUi(mb, eb);
+    assert.ok(same(await blobBytes(mb.w, db.blob), core({ callsign: 'X' }).data), `hz="${bad}" falls back to the default`);
+  }
 });
 
 test('aircraft systems: no field, always on unless the attribute turns it off', async () => {
@@ -320,6 +349,84 @@ test('livery: written on the MSFS 2024 layout, hidden and absent on the others',
   // everything preset except the livery, on a build that cannot use it -> nothing left to ask, so no Convert button
   const auto = mount(`<${TAG} icao-type="B738" callsign="DLH1" model="B738" nickname="" build="other"></${TAG}>`).el();
   assert.ok(hidden(auto, 'f-livery') && $(auto, 'go').hidden, 'a field that cannot apply does not keep Convert alive');
+});
+
+test('altitude offset: shifts the whole track without disturbing ground detection', async () => {
+  const el0 = mount(`<${TAG}></${TAG}>`).el();
+  assert.equal($(el0, 'altitude-offset'), null, 'there is no altitude-offset field');
+
+  let m = mount(`<${TAG} altitude-offset="-8"></${TAG}>`); let el = m.el();
+  typeInto(m.w, el, 'callsign', 'X');
+  let d = await convertViaUi(m, el);
+  assert.ok(same(await blobBytes(m.w, d.blob), core({ callsign: 'X', altitudeOffsetM: -8 }).data), 'reaches the converter');
+
+  const plain = decode(core({ callsign: 'X' }).data, { fs2024: true }).aircraft[0].positions;
+  const moved = decode(core({ callsign: 'X', altitudeOffsetM: -8 }).data, { fs2024: true }).aircraft[0].positions;
+  assert.equal(plain.length, moved.length);
+  for (let i = 0; i < plain.length; i += 137) {
+    assert.ok(Math.abs((plain[i].alt - 8) - moved[i].alt) < 1e-6, 'every altitude moves by exactly the offset');
+    assert.ok(Math.abs((plain[i].elevation - 8) - moved[i].elevation) < 1e-6, 'the ground reference moves with it');
+    assert.equal(plain[i].ground, moved[i].ground, 'on-ground state is unchanged');
+  }
+  assert.deepEqual(moved.map((f) => f.pitch), plain.map((f) => f.pitch), 'attitude is unchanged');
+
+  // URL parameter, its short alias, and values that cannot be used
+  m = mount(`<${TAG}></${TAG}>`, { url: 'https://example.test/?alt-offset=12.5' }); el = m.el();
+  typeInto(m.w, el, 'callsign', 'X');
+  d = await convertViaUi(m, el);
+  assert.ok(same(await blobBytes(m.w, d.blob), core({ callsign: 'X', altitudeOffsetM: 12.5 }).data), 'alt-offset alias works');
+
+  for (const bad of ['501', '-501', 'nope', '']) {
+    const mb = mount(`<${TAG} altitude-offset="${bad}"></${TAG}>`); const eb = mb.el();
+    typeInto(mb.w, eb, 'callsign', 'X');
+    const db = await convertViaUi(mb, eb);
+    assert.ok(same(await blobBytes(mb.w, db.blob), core({ callsign: 'X' }).data), `altitude-offset="${bad}" is ignored`);
+  }
+});
+
+test('position smoothing and ground clearance reach the converter', async () => {
+  let m = mount(`<${TAG}></${TAG}>`); let el = m.el();
+  assert.equal($(el, 'smooth-pos'), null, 'neither adds a field');
+  assert.equal($(el, 'ground-clearance'), null);
+  typeInto(m.w, el, 'callsign', 'X');
+  let d = await convertViaUi(m, el);
+  assert.ok(same(await blobBytes(m.w, d.blob), core({ callsign: 'X' }).data), 'defaults: 3 s smoothing, 0 m clearance, version 21008');
+  assert.equal(decode(await blobBytes(m.w, d.blob), { fs2024: true }).version, 21008);
+
+  m = mount(`<${TAG} smooth-pos="0" ground-clearance="1.2"></${TAG}>`); el = m.el();
+  typeInto(m.w, el, 'callsign', 'X');
+  d = await convertViaUi(m, el);
+  assert.ok(same(await blobBytes(m.w, d.blob), core({ callsign: 'X', smoothPosS: 0, groundClearanceM: 1.2 }).data));
+
+  // 'none' means unknown, which makes JoinFS skip its ground correction rather than guess
+  m = mount(`<${TAG} ground-clearance="none"></${TAG}>`); el = m.el();
+  typeInto(m.w, el, 'callsign', 'X');
+  d = await convertViaUi(m, el);
+  const cg = decode(await blobBytes(m.w, d.blob), { fs2024: true }).aircraft[0].positions[0].staticCgToGround;
+  assert.ok(Number.isNaN(cg), 'ground-clearance="none" writes NaN');
+
+  // smoothing genuinely reduces the frame-to-frame speed step, which is what JoinFS's linear
+  // interpolation turns into a visible jolt
+  const R = 6371008.8;
+  const step = (opts) => {
+    const p = decode(core(Object.assign({ callsign: 'X' }, opts)).data, { fs2024: true }).aircraft[0].positions.filter((f) => !f.ground);
+    const v = [];
+    for (let i = 1; i < p.length; i++) {
+      const a = p[i - 1], b = p[i];
+      v.push(Math.hypot((b.lat - a.lat) * R, (b.lon - a.lon) * R * Math.cos(a.lat), b.alt - a.alt) / (b.t - a.t));
+    }
+    let sum = 0;
+    for (let i = 1; i < v.length; i++) sum += Math.abs(v[i] - v[i - 1]);
+    return sum / (v.length - 1);
+  };
+  assert.ok(step({}) < step({ smoothPosS: 0 }), 'smoothed track has smaller speed steps than the raw one');
+
+  for (const bad of ['-1', '11', 'nope', '']) {
+    const mb = mount(`<${TAG} smooth-pos="${bad}"></${TAG}>`); const eb = mb.el();
+    typeInto(mb.w, eb, 'callsign', 'X');
+    const db = await convertViaUi(mb, eb);
+    assert.ok(same(await blobBytes(mb.w, db.blob), core({ callsign: 'X' }).data), `smooth-pos="${bad}" is ignored`);
+  }
 });
 
 test('flap attributes reach the converter', async () => {

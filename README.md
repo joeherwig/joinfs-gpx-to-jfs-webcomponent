@@ -14,7 +14,7 @@ code, build step or runtime dependency. It also derives gear, flaps and lights f
   in the browser.
 - Material Design look, responsive (320 px and up), light and dark theme following the browser setting.
 - Lazy-loaded language files (English built in, German included), English as the fallback.
-- Tested unit-wise, in jsdom, in a real Chromium, and against an independent Python reference writer.
+- Tested unit-wise, in jsdom and in a real Chromium.
 
 This is an independent tool and not affiliated with JoinFS. See [License](#license).
 
@@ -71,13 +71,72 @@ The GPX needs timestamps. Heading, pitch and bank are derived from the track (se
 | Pilot name | `nickname` | `nickname` | up to 32 chars (empty is allowed) |
 | JoinFS build | `build` | `build` | `fs2024` (default) or `other` |
 
-Two more settings exist but have **no input field**; they are taken from the attribute or URL parameter, or stay at
-their default:
+These settings have **no input field** — they are properties of the recording rather than questions for the pilot.
+Each is taken from the attribute or URL parameter, or stays at its default:
 
 | Setting | Attribute | URL parameter | Values |
 |---|---|---|---|
 | Aircraft systems | `systems` | `systems` | `full` (default) or `off`, see [Gear, flaps and lights](#gear-flaps-and-lights) |
 | Type role | `typerole` | `typerole` | `unknown` (default), `singleprop`, `twinprop`, `airliner`, `rotorcraft`, `glider`, `fighter`, `bomber`, `fourprop`, `airship`, `balloon` |
+| Frame rate | `hz` | `hz` | 1–30, default `5` |
+| Altitude offset | `altitude-offset` | `altitude-offset` (or `alt-offset`) | metres, –500–500, default `0` |
+| Position smoothing | `smooth-pos` | `smooth-pos` | seconds, 0–10, default `3`; `0` disables |
+| Ground clearance | `ground-clearance` | `ground-clearance` | metres, 0–20, or `none` (default) |
+
+**Position smoothing** low-passes the resampled track, and on a real tracklog it is the difference between an
+aircraft that flies and one that surges fore and aft.
+
+The resampler interpolates *through* every source point (cubic Hermite with Catmull-Rom tangents), so GPS noise is
+not averaged away but amplified: each tangent is a difference of neighbouring points, and the spline overshoots
+between them. A 1 Hz tracklog with a metre of noise per sample comes out with its speed swinging by **10 knots or
+more at about half the sample rate**. The simulator follows that, because it drives the injected aircraft from the
+velocity in the recording — zero those velocities and the aircraft drops out of the sky. Smoothing the positions
+removes the oscillation at its source; the written velocity is their derivative, so it becomes smooth with them.
+
+Measured on `demo/sample-track.gpx` (speed swing around its own trend):
+
+| `smooth-pos` | 0 | 1.5 | 3 (default) | 5 |
+|---|---|---|---|---|
+| swing | 6.3 kt | 3.5 kt | 1.8 kt | 1.1 kt |
+| moved by | – | 0.8 m | 1.9 m | 3.7 m |
+
+**The right value depends on your track, so measure it:**
+
+```sh
+npm run track-noise -- path/to/your.gpx
+```
+
+That prints the same table for your own file and names the smallest window that gets the swing under 2 kt. A clean
+track needs none; a rough one may want 5 s or more. "Moved by" is an upper bound on lost detail — on a noisy track
+most of it is the noise being removed, and it only costs you where the raw track was telling the truth, such as a
+landing flare.
+
+Raising the frame rate (`hz`) also helps and the two compose, but smoothing attacks the cause and costs no file
+size. If even a large window leaves too much swing, the limit is the interpolating spline itself; replacing it with
+a fitting (least-squares) one would denoise without blurring, and has not been done.
+
+The **ground clearance** is written into the recording as STATIC CG TO GROUND (file version 21008 and up): how far
+the recorded altitude sits above the point where the wheels touch. A GPX does not say — it carries a receiver
+somewhere in a cabin, not an aircraft geometry — so the default is `none`, written as NaN, which JoinFS reads as
+unknown and takes as a reason to skip its ground-clearance correction rather than guess.
+
+**Do not set this to `0`.** JoinFS cannot tell a declared zero from an aircraft that genuinely sits flush on the
+ground, so it adds the *substitute* model's entire clearance on top of every altitude — the JoinFS source names
+that as the cause of its own "hovers meters above the ground" behaviour. Give it a real figure only if you know
+the one for the aircraft that was recorded.
+
+The **altitude offset** shifts every written altitude, and the ground reference with it, so relative height, the
+on-ground detection and the gear/flaps/lights timing are all unchanged. Use it when the replayed aircraft sits above
+or below the terrain: a GPX carries whatever elevation datum its recorder used, and that need not agree with the
+simulator's terrain mesh. Read the error off the simulator and put the negative of it here – if the aircraft hovers
+8 m up, use `altitude-offset="-8"`. Correcting it in the file rather than with JoinFS's own height adjustment means
+the fix also applies in shared cockpit, which that adjustment does not reach.
+
+The **frame rate** is how often a position is written; the track is resampled onto that grid. 5 Hz is plenty for a
+smooth replay, because JoinFS interpolates between frames. Raising it makes the file proportionally bigger without
+adding detail the GPX does not have – a 20-minute track is 0.57 MB at 5 Hz, 2.23 MB at 20 Hz – so raise it only
+when you actually need the denser grid. Very long tracks are refused at high rates ("the track is too long for the
+chosen frame rate"); lower the rate for those.
 
 **Leave the type role alone unless you know it is right.** JoinFS does not derive it from the ICAO type designator
 when it replays a recording: it reads the byte from the file and feeds it straight into model matching, which awards
@@ -92,7 +151,7 @@ itself. A wrong value is worse than no value.
   (`auto-convert` forces this in general).
 - URL parameters win over attributes; `no-url-params` switches them off.
 - `editable` keeps all fields visible and uses attribute/URL values only as **defaults**.
-- `flaps-takeoff` and `flaps-landing` (0–1, default `0.15` and `1`) set the flap handle position for takeoff and
+- `flaps-takeoff` and `flaps-landing` (0–1, default `0.2` and `1`) set the flap handle position for takeoff and
   landing. They are attributes only, without an input field.
 - The three aircraft defaults are the assumed standard MSFS 2024 Cessna 172 values; please check them against your
   simulator.
@@ -149,9 +208,9 @@ track (thresholds are options of `Gpx2Jfs.convert`; ground speed is used for all
 
 | | Rule |
 |---|---|
-| Flaps, takeoff | 15 % from the start. They retract when the aircraft reaches start elevation + 200 ft if the speed is below 140 kt at that moment, otherwise at + 1000 ft. |
-| Flaps, landing | 100 % as soon as the speed is at most touchdown speed + 20 kt **and** the distance to touchdown (along the track) is at most 3 nm below 100 kt or 7 nm at 100 kt and above, while airborne. After touchdown they go up again below 30 kt. |
-| Gear | Up together with the takeoff flaps, down 1 nm (along the track) before the flaps-full point. The handle is written for fixed-gear aircraft too; the simulator is expected to ignore it. |
+| Flaps, takeoff | 20 % from the start. They retract when the aircraft reaches start elevation + 200 ft if the speed is below 140 kt at that moment, otherwise at + 1000 ft. |
+| Flaps, landing | Extended in stages as the aircraft slows, each stage keyed to how far it still is above the speed it will actually touch down at: 33 % at touchdown speed + 40 kt, 67 % at + 30 kt, 100 % at + 20 kt (`flapsLandingSteps`, `flapsLandingVtdMarginKt`). Every stage also has to be close enough for the slowdown to be an approach — within 7 nm, and within 1.5 nm once below 100 kt for full flaps. At least 20 s between stages, so an aircraft that decelerates quickly still extends them visibly rather than in one jump. After touchdown they go up again below 30 kt. |
+| Gear | Up together with the takeoff flaps, down 1 nm (along the track) before the flaps-full point — which on a normal approach puts it after the first flap stages. The handle is written for fixed-gear aircraft too; the simulator is expected to ignore it. |
 | Nav, beacon | On for the whole track. |
 | Strobe | On from the start of the takeoff roll until the runway is vacated (below 30 kt after touchdown). |
 | Landing light | On at 4000 ft above the ground reference or lower, off again above 4300 ft (300 ft hysteresis), between the start of the takeoff roll and vacating the runway. The reference moves linearly from the start to the end elevation. |
@@ -159,11 +218,11 @@ track (thresholds are options of `Gpx2Jfs.convert`; ground speed is used for all
 
 Every event is found once over the whole track and then latched, so speed noise around a threshold cannot make a
 setting flip back and forth. Only the ground contact is debounced (5 s). The rules assume one takeoff and one final
-landing; touch-and-go patterns in between are not treated separately. Touchdown is detected 8 m above the ground,
-so distance-based triggers fire about 0.2 nm early.
+landing; touch-and-go patterns in between are not treated separately.
 
-The simulator maps the flap value to the nearest detent, so a value like 15 % may land on flaps up on an aircraft
-with few detents. Adjust `flaps-takeoff` for your aircraft.
+The simulator maps the flap value to the nearest detent, so a value like 20 % may land on flaps up on an aircraft
+with few detents. Adjust `flaps-takeoff` for your aircraft, and `flapsLandingSteps` if its approach flap settings
+are not thirds.
 
 How it is stored: `GEAR HANDLE POSITION`, `FLAPS HANDLE PERCENT`, `LIGHT STATES` (the bit mask that drives the
 lights, plus its per-bit mirrors) and `LIGHT STROBE` as timestamped variable frames. The variable IDs are hashes of
@@ -175,9 +234,10 @@ hour of flight.
 
 A GPX only contains position, altitude and time, so:
 
-- The 1 Hz track is smoothed with a cubic spline and written at 5 Hz (API option `hz`; JoinFS interpolates
-  between frames by their timestamps, so the rate only affects smoothness and file size). Long standstills in the
-  track are held in place, other long gaps are bridged in a straight line.
+- The 1 Hz track is smoothed with a cubic spline and written at 5 Hz (the `hz` attribute / URL parameter, or the
+  API option of the same name; JoinFS interpolates between frames by their timestamps, so the rate only affects
+  smoothness and file size). Long standstills in the track are held in place, other long gaps are bridged in a
+  straight line.
 - **Heading** = course over ground, **pitch** = flight-path angle plus a 2° trim, **bank** = coordinated-turn bank
   from the heading rate (clamped to ±45°). Sign conventions follow JoinFS: positive pitch = nose down, positive bank
   = left wing down.
@@ -189,7 +249,7 @@ A GPX only contains position, altitude and time, so:
 Little-endian, written like a .NET `BinaryWriter`; units are radians, metres and m/s.
 
 ```
-int16   version                       21005 (21003 = without ICAO strings, 21008 = with static CG field)
+int16   version                       21008 (21005 = without static CG field, 21003 = also without ICAO strings)
 int32   aircraft count                1
   bool    plane
   string  callsign, nickname, model   7-bit length prefix + UTF-8
@@ -240,6 +300,7 @@ npm run test:browser     # real-browser tests (optional packages puppeteer-core 
 npm run test:all
 npm run sample           # regenerate demo/sample-track.gpx
 npm run screenshots      # regenerate docs/screenshots (needs the optional browser packages)
+npm run track-noise -- x.gpx   # how much a track surges, and what smooth-pos costs to stop it
 ```
 
 `@sparticuz/chromium` ships a Linux binary only, so on Windows and macOS the browser tests skip and the screenshot
@@ -252,7 +313,7 @@ CHROME_PATH="/c/Program Files/Google/Chrome/Application/chrome.exe" npm run test
 | Suite | Covers |
 |---|---|
 | `test/converter.test.js` | GPX parsing, file layout for all three layouts, heading/pitch/bank and their signs, gaps, gear/flaps/lights rules (hysteresis, speed + distance rule, gear timing, options), worker path, snapshot hash |
-| `test/reference.test.js` | Byte-for-byte comparison with `tools/reference/gpx2jfs.py` (needs Python 3; skipped without it) |
+| `test/reference.test.js` | Retired: the converter and the Python reference have intentionally diverged (see the note in the file) |
 | `test/component.test.js` | Presets, URL parameters, drop zone, download, persistence, type role, aircraft systems, languages (jsdom) |
 | `test/locales.test.js` | Every language file is complete and has matching placeholders |
 | `test/browser/browser.test.js` | Full flow with the Web Worker, drag and drop, real HTTP locale loading, colour schemes, 320–1280 px layout |
@@ -272,7 +333,7 @@ src/         the component and its language files (ship these)
 demo/        demo page and synthetic sample GPX
 docs/        screenshots
 test/        test suites, helpers (synthetic flights, independent .jfs decoder) and the runner
-tools/       Python reference writer, sample GPX generator
+tools/       sample GPX generator, track-noise measurement, screenshots, retired Python reference writer
 ```
 
 ## License
