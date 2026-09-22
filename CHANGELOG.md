@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Field-elevation picker.** Once a GPX is loaded, the converter shows where it touches the ground (the same
+  detection [Gear, flaps and lights](README.md#gear-flaps-and-lights) uses) alongside its own GPX-derived
+  elevation there, with a field for the real figure read off JoinFS's Aircraft dialog after parking at that spot.
+  Filling it in computes and applies the equivalent `altitude-offset`, so a track that sits wrong no longer needs
+  that arithmetic done by hand. A second ground contact (e.g. the arrival field), if present, is shown for
+  comparison only - one offset applies to the whole file. Never applied without being filled in.
+- **Elevation-scale detection.** New `elevation-scale` setting (attribute/URL parameter, 1-20, default 1) that
+  multiplies every GPX elevation before anything else touches it - climb rate, descent rate and max altitude
+  scale with it, which no additive `altitude-offset` can do. Added after a real file (an IGC->GPX conversion via
+  gpxoverlay.com) turned out to have every altitude written at a tenth of its real size - every elevation an
+  exact multiple of 0.1 m is not something genuine GPS/baro precision produces, so the component now detects that
+  shape automatically and offers a ×10 fix with a checkbox, never applying it silently. gpxoverlay.com's own
+  changelog documents a related altitude-scaling bug fixed in 12.2025 ("previously altitude was 10x higher than
+  it should be") - the *opposite* direction from what this file showed, so this may be a different bug, a
+  regression, or an edge case in the same step; not confirmed to be the same issue.
 - The **aircraft type** and **aircraft systems** dropdowns are gone. Both stay available as attributes and URL
   parameters (`typerole`, `systems`), they are simply no longer questions the user is asked.
 - The default type role is now `unknown` (byte 0) instead of `singleprop` (1). JoinFS reads the byte from the
@@ -12,6 +27,31 @@
 - The real-browser tests and the screenshot tool accept `CHROME_PATH` (a locally installed Chrome/Edge), so they
   run on Windows and macOS instead of skipping - `@sparticuz/chromium` carries a Linux binary only.
 - Screenshots regenerated.
+- **Control-surface deflections can be inferred from the track** (`controls="derived"`, default `off`). A GPX
+  records no control data, so they were written neutral; derived mode works them out from the manoeuvre instead -
+  aileron from the roll rate, so it deflects to roll into a turn, sits neutral once established and reverses to
+  roll out; elevator from the pitch rate plus the back-pressure holding a banked turn; rudder tracking the
+  aileron for adverse yaw. Tunable via `controlsRollFullDps`, `controlsPitchFullDps`, `controlsLoadFullG` and
+  `controlsRudderRatio`. Cosmetic - the surfaces move, the aircraft does not - and held neutral whenever the
+  on-ground flag is set, because JoinFS feeds these to the simulator where rudder drives nosewheel steering and
+  its own source blames that coupling for violent ground shaking.
+- **The on-ground altitude floor follows the declared ground clearance**, so the altitude written agrees with what
+  `groundClearanceM` claims about it. Unchanged at the default 0; setting the spawned model's real gear height now
+  leaves JoinFS's ground-clearance correction with nothing to add, which removes the step at liftoff where that
+  correction was previously switched off.
+- **`ground-clearance` defaults to `0` again**, now that it is true: the on-ground clamp puts the written
+  altitude exactly at the field reference, so declaring it the wheel contact point is accurate, and JoinFS adds
+  the spawned model's own gear height to seat it. `none` (NaN) remains available and makes JoinFS skip the
+  correction entirely.
+- **An aircraft on the ground is no longer written below the ground.** The vertical noise of a real tracklog
+  dips under the field for about a third of the on-ground samples - on a measured flight the whole 24-second
+  takeoff roll was commanded between 0.95 m and 1.9 m below it. An altitude under the simulator's terrain sets
+  the simulator's own penetration correction pushing up against ours pushing down on every tick, which is felt as
+  the aircraft shivering while parked and through the roll, and as a step when the on-ground flag lets go and the
+  commanded altitude finally takes over. The on-ground altitude is now clamped to the field reference (clamped,
+  not flattened: the last metre before liftoff is a real climb and stays continuous into the airborne samples).
+  Deepest excursion on that flight goes from -1920 mm to -0.0055 mm, the latter being the float32 rounding of the
+  written GROUND ALTITUDE field rather than penetration.
 - **The aircraft is no longer pinned to the runway through the first metres of the climb, nor put down early on
   landing.** SIM ON GROUND is forwarded to the simulator, which then places the aircraft on the terrain itself and
   disregards the altitude in the recording - and it was being written from `groundAglM`, the deliberately generous

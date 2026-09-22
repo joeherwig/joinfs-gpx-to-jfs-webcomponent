@@ -79,9 +79,11 @@ Each is taken from the attribute or URL parameter, or stays at its default:
 | Aircraft systems | `systems` | `systems` | `full` (default) or `off`, see [Gear, flaps and lights](#gear-flaps-and-lights) |
 | Type role | `typerole` | `typerole` | `unknown` (default), `singleprop`, `twinprop`, `airliner`, `rotorcraft`, `glider`, `fighter`, `bomber`, `fourprop`, `airship`, `balloon` |
 | Frame rate | `hz` | `hz` | 1–30, default `5` |
+| Elevation scale | `elevation-scale` | `elevation-scale` | 1–20, default `1` |
 | Altitude offset | `altitude-offset` | `altitude-offset` (or `alt-offset`) | metres, –500–500, default `0` |
 | Position smoothing | `smooth-pos` | `smooth-pos` | seconds, 0–10, default `3`; `0` disables |
-| Ground clearance | `ground-clearance` | `ground-clearance` | metres, 0–20, or `none` (default) |
+| Ground clearance | `ground-clearance` | `ground-clearance` | metres, 0–20 (default `0`), or `none` |
+| Control surfaces | `controls` | `controls` | `off` (default) or `derived` |
 
 **Position smoothing** low-passes the resampled track, and on a real tracklog it is the difference between an
 aircraft that flies and one that surges fore and aft.
@@ -116,14 +118,26 @@ size. If even a large window leaves too much swing, the limit is the interpolati
 a fitting (least-squares) one would denoise without blurring, and has not been done.
 
 The **ground clearance** is written into the recording as STATIC CG TO GROUND (file version 21008 and up): how far
-the recorded altitude sits above the point where the wheels touch. A GPX does not say — it carries a receiver
-somewhere in a cabin, not an aircraft geometry — so the default is `none`, written as NaN, which JoinFS reads as
-unknown and takes as a reason to skip its ground-clearance correction rather than guess.
+the recorded altitude sits above the point where the wheels touch. `0`, the default, says “the altitude written is
+the contact point” — which the on-ground clamp below makes true — and JoinFS answers by adding the clearance of
+whichever model it actually spawns, seating that model's wheels on the terrain whether it is larger or smaller
+than the one recorded.
 
-**Do not set this to `0`.** JoinFS cannot tell a declared zero from an aircraft that genuinely sits flush on the
-ground, so it adds the *substitute* model's entire clearance on top of every altitude — the JoinFS source names
-that as the cause of its own "hovers meters above the ground" behaviour. Give it a real figure only if you know
-the one for the aircraft that was recorded.
+That is only honest *because* of the clamp. Before it, the clearance was added on top of a datum that could be
+metres out, which is the JoinFS source's “hovers meters above the ground”. If the spawned model still ends up too
+high, `ground-clearance="none"` writes NaN instead and JoinFS makes no ground correction at all.
+
+The **elevation scale** multiplies every elevation read from the GPX, before anything else touches it, so climb
+rate, descent rate and max altitude scale with it too — unlike the offset below, which only shifts a wrong
+*datum*, this is the fix for a wrong *unit*. It exists because of a real file: an IGC→GPX conversion
+(gpxoverlay.com) that wrote every altitude at a tenth of its real size, turning a flight that actually climbed
+some 640 m into a track that looked flat to 64 m. The component detects this automatically once a file is loaded —
+every elevation landing on an exact multiple of 0.1 m, across at least 20 points with real vertical range, is not
+something genuine GPS or barometric altitude does — and offers a ×10 fix rather than applying one silently; see
+[If your track's altitude looks wrong](#if-your-tracks-altitude-looks-wrong). gpxoverlay.com's own changelog
+records a related altitude-scaling bug fixed in December 2025 ("previously altitude was 10x higher than it should
+be") — the *opposite* direction from what this file showed, so it may be a different bug, a regression, or an
+edge case in the same conversion step; not confirmed to be the same issue, worth reporting either way.
 
 The **altitude offset** shifts every written altitude, and the ground reference with it, so relative height, the
 on-ground detection and the gear/flaps/lights timing are all unchanged. Use it when the replayed aircraft sits above
@@ -163,6 +177,25 @@ itself. A wrong value is worse than no value.
   so switching back brings it up again.
 
 Example: `demo/index.html?icao=C172&callsign=ASGX&model=Cessna%20172%20Wheels`
+
+### If your track's altitude looks wrong
+
+Two things happen automatically once a GPX is loaded, both purely advisory — neither ever changes the conversion
+by itself, the same "suggest, don't auto-apply" rule every hidden setting above follows.
+
+**A scale-bug warning**, if every elevation in the file is an exact multiple of 0.1 m across at least 20 points
+with real vertical range — see [elevation scale](#attributes-and-url-parameters) above for why that is the sign
+of a lost digit rather than genuine precision. A checkbox offers the ×10 fix; nothing is applied until it is
+ticked, and unticking it (or never ticking it) leaves the conversion exactly as if the file had never been flagged.
+
+**A field-elevation picker.** The converter already finds where the track touches the ground the same way it
+decides gear/flaps/lights timing — see [Gear, flaps and lights](#gear-flaps-and-lights) — and once it has, it
+shows the departure point's coordinates and what the GPX itself says the elevation is there, with a field for what
+JoinFS actually shows at that position (park there in the simulator and read its Aircraft dialog — labelled in
+feet, matching that dialog). Filling it in computes and applies the equivalent `altitude-offset` for you, so
+getting a track to sit right no longer needs doing that arithmetic by hand. If the track also touches down
+somewhere else, that point's coordinates and GPX elevation are shown too, for comparison — not editable, since
+only one offset applies to the whole file (see [altitude offset](#attributes-and-url-parameters) above).
 
 ### Remembered settings
 

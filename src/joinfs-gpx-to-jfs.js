@@ -49,9 +49,16 @@
       // first 8 m of the climb and is let go with a jump, and on approach it is put down 8 m early. This
       // tighter figure trims each ground stretch back to where the wheels actually are.
       groundContactM: 1.0,
+      // Multiplies every elevation read from the GPX, before anything else touches it - so climb rate, descent
+      // rate and max altitude scale with it too, not just the ground reference. This is the fix for a genuinely
+      // wrong unit in the source file (see elevationLooksScaled - e.g. an IGC->GPX conversion that wrote every
+      // altitude at a tenth of its real size); it is not the fix for a *shifted* datum, which is what
+      // altitudeOffsetM below is for. 1 = unchanged.
+      elevationScale: 1,
       // Shifts every written altitude (and the ground reference with it, so AGL and the on-ground detection are
       // unchanged). A GPX carries whatever elevation datum its recorder used, which need not agree with the
       // simulator's terrain mesh; the difference shows up as an aircraft that sits above or below the ground.
+      // Applied after elevationScale.
       altitudeOffsetM: 0,
       // Low-pass the resampled track itself, in seconds; 0 disables it. The resampler interpolates *through* every
       // source point (cubic Hermite with Catmull-Rom tangents), so GPS noise is not averaged out but amplified:
@@ -69,16 +76,25 @@
       // flag flips - at rotation, at touchdown, and repeatedly if the flag chatters near its threshold.
       groundBlendS: 2,
       // STATIC CG TO GROUND, in metres, written in file version 21008 and up: how far the recorded altitude sits
-      // above the point where the wheels touch. A GPX does not say - it carries a receiver somewhere in a cabin,
-      // not an aircraft geometry - so the default is null, written as NaN, which JoinFS reads as "unknown" and
-      // skips its ground-clearance correction rather than guessing.
+      // above the point where the wheels touch. 0 says "my altitude is the contact point", and JoinFS answers by
+      // adding the clearance of whichever model it actually spawns - seating that model's wheels on the terrain
+      // whether it is bigger or smaller than the one that was recorded.
       //
-      // Do NOT default this to 0. JoinFS cannot tell a declared 0 from an aircraft that genuinely sits flush on
-      // the ground, so it adds the *substitute* model's full clearance on top of every altitude - the JoinFS
-      // source names that as the cause of its "hovers meters above the ground" bug, and it does exactly that
-      // here: the injected aircraft floats by however much the spawned model's gear is deep. Set it only when
-      // the real figure for the recorded aircraft is known.
-      groundClearanceM: null,
+      // 0 is truthful here only because the on-ground altitude is clamped to the field reference further down:
+      // while the aircraft is down, what is written *is* the ground. It was wrong before that clamp existed -
+      // the clearance was then added on top of a datum that was already metres out, which is the JoinFS source's
+      // "hovers meters above the ground". `null` writes NaN instead, which JoinFS reads as unknown and answers by
+      // making no ground correction at all; use it if the spawned model ends up sitting too high.
+      groundClearanceM: 0,
+      // Control-surface deflections. 'off' (the default) writes them neutral, which is all a GPX honestly
+      // supports - it records no control data at all; 'derived' infers them from the manoeuvre the track
+      // describes, see the note in derive(). Cosmetic either way: they move the surfaces, not the aircraft.
+      // Neutral on the ground in both modes.
+      controls: 'off',
+      controlsRollFullDps: 30,      // roll rate that means full aileron
+      controlsPitchFullDps: 10,     // pitch rate that means full elevator
+      controlsLoadFullG: 1.0,       // extra load factor that means full elevator, added to the pitch-rate term
+      controlsRudderRatio: 0.3,     // rudder as a fraction of the aileron deflection
       jfsVersion: 21008, fs2024: true, icaoType: 'C172', icaoAirline: '', livery: '', maxPoints: 200000,
       // Aircraft systems (gear, flaps, lights) derived from the track. systems: 'full' | 'off'
       systems: 'full',
@@ -342,21 +358,82 @@
       // 0 on the ground, 1 airborne, ramped across the transition so the attitude never steps
       const airborne = movingAvg(onGround, Math.max(1, Math.trunc(o.groundBlendS * o.hz)) | 1);
 
+      // attitude first, as written: the control deflections below are taken from how it changes
+      const pitchOut = new Array(n), bankOut = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const fpa = Math.atan2(vUs[i], Math.max(gs[i], 1.0));
+        const w = airborne[i];
+        pitchOut[i] = -w * Math.max(-rad(30), Math.min(rad(30), fpa + rad(o.pitchTrimDeg)));
+        bankOut[i] = -w * bankRight[i];
+      }
+
+      // Control surfaces. Nothing in a GPX records them, so they are inferred from the manoeuvre the track
+      // describes, and they are cosmetic: position and attitude are commanded directly, these only move the
+      // surfaces. A deflection commands a *rate*, not an angle - so aileron follows the roll rate and is neutral
+      // in an established turn, deflecting one way to roll in and the other to roll out; elevator follows the
+      // pitch rate plus the back-pressure that holds a banked turn (load factor 1/cos(bank) - 1); rudder is small
+      // and tracks the aileron, standing in for the adverse-yaw compensation of coordinated flight.
+      //
+      // All three are multiplied by the airborne weight, so they stay neutral on the ground. That is deliberate:
+      // JoinFS feeds these straight to the simulator as RUDDER_SET/ELEVATOR_SET/AILERON_SET, and its own source
+      // blames nosewheel-steering-to-rudder coupling for violent shaking when the two authorities fight on the
+      // ground. Ground steering is not worth that risk for a cosmetic surface.
+      const surfaces = new Array(n);
+      if (o.controls === 'derived') {
+        const rate = (arr) => {
+          const out = new Array(n);
+          for (let i = 0; i < n; i++) {
+            const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+            out[i] = b > a ? (arr[b] - arr[a]) / ((b - a) * dt) : 0;
+          }
+          return out;
+        };
+        const rollRate = rate(bankOut), pitchRate = rate(pitchOut);
+        const clamp1 = (x) => Math.max(-1, Math.min(1, x));
+        const rollFull = rad(o.controlsRollFullDps), pitchFull = rad(o.controlsPitchFullDps);
+        for (let i = 0; i < n; i++) {
+          // hard zero while the ground flag is set, not merely faded by the blend: the blend window reaches
+          // across the transition, and a surface that is neutral except for the last second of the takeoff roll
+          // would put rudder into nosewheel steering at exactly the wrong moment
+          const w = onGround[i] === 0 ? 0 : airborne[i];
+          const ail = clamp1(rollRate[i] / rollFull);
+          const load = 1 / Math.max(0.2, Math.cos(bankOut[i])) - 1;
+          const ele = clamp1(pitchRate[i] / pitchFull + load / o.controlsLoadFullG);
+          surfaces[i] = { rudder: w * clamp1(ail * o.controlsRudderRatio), elevator: w * ele, aileron: w * ail };
+        }
+      } else {
+        for (let i = 0; i < n; i++) surfaces[i] = { rudder: 0, elevator: 0, aileron: 0 };
+      }
+
       const samples = new Array(n);
       for (let i = 0; i < n; i++) {
         const ref = groundRef[i];
         const ground = onGround[i] === 0;
-        const fpa = Math.atan2(vUs[i], Math.max(gs[i], 1.0));
-        const w = airborne[i];
-        const pitchUp = w * Math.max(-rad(30), Math.min(rad(30), fpa + rad(o.pitchTrimDeg)));
-        const bankR = w * bankRight[i];
+        // An aircraft on the ground is not below it. The vertical noise of a GPS track says otherwise for about a
+        // third of the on-ground samples, by up to two metres, and an altitude commanded below the simulator's
+        // terrain sets the simulator's own penetration correction pushing up against ours pushing down, every
+        // tick - seen as the aircraft shivering while parked and through the whole takeoff roll. Clamped rather
+        // than flattened to the floor: the last metre before the on-ground flag lets go is a real climb, and it
+        // has to stay continuous into the airborne samples.
+        //
+        // The floor is the field plus whatever clearance the recording declares, so the altitude written agrees
+        // with what groundClearanceM says about it. At the default 0 the two are the same. Declaring the spawned
+        // model's real gear height instead leaves JoinFS's ground-clearance correction with nothing to add, which
+        // is what removes the step at liftoff when that correction is switched off again.
+        const floor = ref + (o.groundClearanceM || 0);
+        const altOut = ground ? Math.max(alt[i], floor) : alt[i];
         samples[i] = {
-          t: t[i], lat: lat[i], lon: lon[i], alt: alt[i],
-          pitch: -pitchUp, bank: -bankR, heading: pmod(heading[i], 2 * Math.PI),
+          t: t[i], lat: lat[i], lon: lon[i], alt: altOut,
+          pitch: pitchOut[i], bank: bankOut[i], heading: pmod(heading[i], 2 * Math.PI),
           vE: vE[i], vU: vU[i], vN: vN[i], gs: gs[i], ground, elevation: ref,
+          rudder: surfaces[i].rudder, elevator: surfaces[i].elevator, aileron: surfaces[i].aileron,
         };
       }
-      return samples;
+      // One entry per unbroken on-ground stretch, in the shape info.systems.groundStretches exposes: where it
+      // is and what elevation the GPX (plus any altitudeOffsetM already applied above) puts it at, so a caller
+      // can ask "is this right?" and compute a correction without repeating the detection itself.
+      const groundStretches = stretches.map((s) => ({ lat: deg(lat[s.start]), lon: deg(lon[s.start]), elevM: s.elev }));
+      return { samples, groundStretches };
     }
 
     // ---- .jfs writer ----------------------------------------------
@@ -406,7 +483,9 @@
         for (const f of [s.pitch, s.bank, s.heading, s.vE, s.vU, s.vN, 0, 0, 0, 0, 0, 0]) {
           dv.setFloat32(p, f, true); p += 4;
         }
-        for (let i = 0; i < 5; i++) { dv.setInt16(p, 0, true); p += 2; }   // rudder, elevator, aileron, brakes
+        // rudder, elevator, aileron, then both brakes - value * 16384, as a .NET BinaryWriter would
+        const axis = (x) => Math.max(-16384, Math.min(16384, Math.round((x || 0) * 16384)));
+        for (const c of [s.rudder, s.elevator, s.aileron, 0, 0]) { dv.setInt16(p, axis(c), true); p += 2; }
         dv.setFloat32(p, s.elevation, true); p += 4;
         dv.setUint8(p, s.ground ? 1 : 0); p += 1;
         if (v >= 21008) { dv.setFloat32(p, cgFt, true); p += 4; }
@@ -629,11 +708,12 @@
       const rep = (a, b) => (onProgress ? (x) => onProgress(a + (b - a) * x) : null);
       if (rawPts.length > o.maxPoints) throw new GpxError('Track too large (' + rawPts.length + ' points, limit ' + o.maxPoints + ')', 'tooLarge', { points: rawPts.length, limit: o.maxPoints });
       const pts = clean(rawPts);
+      if (o.elevationScale !== 1) for (const p of pts) p.ele *= o.elevationScale;
       if (pts.length < 2) throw new GpxError('Track has fewer than 2 distinct timestamps', 'fewDistinct');
       const dur = pts[pts.length - 1].t - pts[0].t;
       if (dur * o.hz > 1500000) throw new GpxError('Track too long for the chosen frame rate', 'tooLong');
       const grid = resample(pts, o, rep(0, 0.35));
-      const samples = derive(grid, o, rep(0.35, 0.6));
+      const { samples, groundStretches } = derive(grid, o, rep(0.35, 0.6));
       const plan = o.systems === 'off' ? null : planSystems(samples, o);
       const sys = plan ? buildSystemFrames(plan, samples, o) : null;
       const data = writeJfs(samples, o, rep(0.6, 1), sys);
@@ -650,6 +730,7 @@
           distanceKm: Math.round(dist / 10) / 100, maxAltM: r1(maxAlt), maxSpeedKt: r1(maxSp / KT),
           bytes: data.length, jfsVersion: o.jfsVersion,
           systems: plan ? Object.assign({ variableFrames: sys.count }, plan.marks) : null,
+          groundStretches,
         },
       };
     }
@@ -741,6 +822,24 @@
       }
     }
     return { pts, name };
+  }
+
+  // Flags a GPX whose elevation looks like it lost a digit in whatever produced the file - seen in an IGC->GPX
+  // conversion (gpxoverlay.com) that wrote real terrain heights of several hundred metres as a value one tenth
+  // their size. The tell: genuine GPS/barometric altitude essentially never lands exactly on a multiple of 0.1 m
+  // for more than a handful of points in a row, so a track where *every* point does is almost certainly an
+  // integer-metres value with its decimal point one digit too early, not real sub-metre precision. Requires some
+  // real vertical movement too, so a short, genuinely flat track (e.g. taxi-only) is never a false positive.
+  // Advisory only - never applied without confirmation, see DEFAULTS.elevationScale.
+  function elevationLooksScaled(pts) {
+    if (pts.length < 20) return false;
+    let min = Infinity, max = -Infinity;
+    for (const p of pts) {
+      if (Math.abs(Math.round(p.ele * 10) - p.ele * 10) > 1e-6) return false;
+      if (p.ele < min) min = p.ele;
+      if (p.ele > max) max = p.ele;
+    }
+    return max - min >= 3;
   }
 
   // ==================================================================
@@ -839,7 +938,7 @@
     return e;
   }
 
-  const api = { convert, convertAsync, parseGpx, TYPEROLES, DEFAULTS, GpxError, _workerSource: workerSource, _core: core };
+  const api = { convert, convertAsync, parseGpx, elevationLooksScaled, TYPEROLES, DEFAULTS, GpxError, _workerSource: workerSource, _core: core };
   root.Gpx2Jfs = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 
@@ -876,6 +975,17 @@
     'build.fs2024': 'MSFS 2024',
     'build.other': 'MSFS 2020 / FSX / P3D / X-Plane',
     'preset.title': 'Preset by this page',
+    'warn.elevationScale': 'This track\u2019s elevation looks like it lost a digit somewhere \u2013 every value is an exact multiple of 0.1, which real GPS or barometric altitude never is. A known cause is an IGC-to-GPX conversion step that writes real terrain heights at a tenth of their size.',
+    'btn.applyElevationScale': 'Multiply every altitude by 10',
+    'field.fieldElev': 'Ground contact near {lat}, {lon} \u2013 the GPX puts it at {gpxFt} ft. What does JoinFS show there?',
+    'field.fieldElevPlaceholder': 'ft',
+    'unit.ft': 'ft',
+    'hint.arrivalElev': 'Also touches down near {lat}, {lon}, GPX says {gpxFt} ft \u2013 for comparison, not editable here.',
+    'btn.lookupAgain': 'Look up again',
+    'status.checkingElevation': 'Checking online\u2026',
+    'hint.fieldSourceLookup': 'Source: looked up online, about {ft} ft.',
+    'hint.fieldSourceManual': 'Source: entered by hand.',
+    'err.elevationLookup': 'Couldn\u2019t look that up \u2013 offline, or the request failed. Enter it by hand instead.',
     'btn.convert': 'Convert',
     'btn.cancel': 'Cancel',
     'btn.reset': 'Reset to defaults',
@@ -913,7 +1023,7 @@
   //   icao-type | ?icao   callsign   model   nickname   build
   //   A valid value PRESETS the setting and hides its input field. Add the boolean attribute `editable`
   //   to keep the fields visible and use the values only as defaults instead.
-  //   typerole  systems  hz  altitude-offset  smooth-pos  ground-clearance
+  //   typerole  systems  hz  elevation-scale  altitude-offset  smooth-pos  ground-clearance  controls
   //                     no input field at all - attribute / URL parameter or the default (see HIDDEN)
   //   no-url-params   ignore URL parameters          auto-convert   convert as soon as a file is loaded
   //   lang | ?lang    force a UI language            locale-base    folder of the locale files (default: folder of this script)
@@ -939,14 +1049,16 @@
     // an escape hatch, but it is not a question to put to the user.
     // `hz` is here too: the output frame rate is a property of the file, not something to ask a pilot about, but
     // 5 Hz is not right for everyone (a 20 Hz recording is four times the frames and four times the size).
-    const HIDDEN = ['typerole', 'systems', 'hz', 'altitudeOffset', 'smoothPos', 'groundClearance'];
+    const HIDDEN = ['typerole', 'systems', 'hz', 'elevationScale', 'altitudeOffset', 'smoothPos', 'groundClearance', 'controls'];
     const KEYS = FIELDS.concat(HIDDEN);
     const BASE_DEFAULTS = {
       icaoType: DEFAULTS.icaoType, callsign: DEFAULTS.callsign, model: DEFAULTS.model, livery: '', nickname: '',
       typerole: 'unknown', systems: 'full', build: 'fs2024', hz: String(DEFAULTS.hz),
+      elevationScale: String(DEFAULTS.elevationScale),
       altitudeOffset: String(DEFAULTS.altitudeOffsetM),
       smoothPos: String(DEFAULTS.smoothPosS),
       groundClearance: DEFAULTS.groundClearanceM === null ? 'none' : String(DEFAULTS.groundClearanceM),
+      controls: DEFAULTS.controls,
     };
     // A blank attribute is not a value: Number('') is 0, which would silently turn a numeric setting into
     // "0" rather than leaving it at its default. Reject it before the range check.
@@ -970,21 +1082,26 @@
       // 1-30 Hz; the converter still refuses a track that would blow up the frame count (err.tooLong)
       hz: num(1, 30),
       // metres, +/- 500: enough for any terrain-datum mismatch, small enough that a typo cannot send a track into orbit
+      // 1-20: covers the x10 bug (and, generously, any other lost-digit variant) without letting a typo
+      // send a track into orbit
+      elevationScale: num(1, 20),
       altitudeOffset: num(-500, 500),
       smoothPos: num(0, 10),
       // 'none' writes NaN: JoinFS then treats the clearance as unknown and makes no ground correction at all
       groundClearance: (v) => (String(v).trim() === 'none' ? 'none' : num(0, 20)(v)),
+      controls: (v) => (['off', 'derived'].includes(String(v).trim()) ? String(v).trim() : undefined),
     };
     const PARAM_NAMES = {
       icaoType: ['icao', 'icao-type'], callsign: ['callsign'], model: ['model'], livery: ['livery'], nickname: ['nickname'],
       typerole: ['typerole'], build: ['build'], systems: ['systems'], hz: ['hz'],
+      elevationScale: ['elevation-scale'],
       altitudeOffset: ['altitude-offset', 'alt-offset'],
-      smoothPos: ['smooth-pos'], groundClearance: ['ground-clearance'],
+      smoothPos: ['smooth-pos'], groundClearance: ['ground-clearance'], controls: ['controls'],
     };
     const ATTR_NAMES = {
       icaoType: 'icao-type', callsign: 'callsign', model: 'model', livery: 'livery', nickname: 'nickname',
-      typerole: 'typerole', build: 'build', systems: 'systems', hz: 'hz', altitudeOffset: 'altitude-offset',
-      smoothPos: 'smooth-pos', groundClearance: 'ground-clearance',
+      typerole: 'typerole', build: 'build', systems: 'systems', hz: 'hz', elevationScale: 'elevation-scale', altitudeOffset: 'altitude-offset',
+      smoothPos: 'smooth-pos', groundClearance: 'ground-clearance', controls: 'controls',
     };
 
     async function fetchLocale(url) {
@@ -999,6 +1116,27 @@
         const out = {};
         for (const k of Object.keys(data)) if (typeof data[k] === 'string') out[k] = data[k];
         return Object.keys(out).length ? out : null;
+      } catch (_) { return null; } finally { if (timer) clearTimeout(timer); }
+    }
+
+    // Real terrain elevation for one point, from a public, key-free, CORS-enabled DEM API (Open-Meteo, Copernicus
+    // data) - verified with a genuine cross-origin request, not just that the endpoint answers:
+    //   curl -D - "https://api.open-meteo.com/v1/elevation?...&longitude=..." -H "Origin: https://example.com"
+    //   access-control-allow-origin: *
+    // The only network call this component ever makes other than loading its own locale files, and only on an
+    // explicit click - see the "Verify online" button in renderGround(). Returns metres, or null on any failure
+    // (offline, blocked, rate-limited, a page's own CSP disallowing it) - callers fail visibly, never silently.
+    async function lookupElevation(lat, lon) {
+      if (typeof root.fetch !== 'function') return null;
+      const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = ac ? setTimeout(() => ac.abort(), 4000) : null;
+      try {
+        const url = 'https://api.open-meteo.com/v1/elevation?latitude=' + lat + '&longitude=' + lon;
+        const res = await root.fetch(url, { signal: ac ? ac.signal : undefined, credentials: 'same-origin' });
+        if (!res.ok) return null;
+        const data = JSON.parse(await res.text());
+        const m = data && Array.isArray(data.elevation) ? data.elevation[0] : undefined;
+        return typeof m === 'number' && Number.isFinite(m) ? m : null;
       } catch (_) { return null; } finally { if (timer) clearTimeout(timer); }
     }
 
@@ -1066,6 +1204,16 @@ svg{fill:currentColor}
   color:color-mix(in srgb,var(--_muted) 60%,transparent)}
 .uc{text-transform:uppercase}.uc::placeholder{text-transform:uppercase}
 .preset{margin-top:1.25rem;padding:.5rem .75rem;border-radius:8px;font-size:.875rem;color:var(--_muted);background:rgba(103,80,164,.08);background:color-mix(in srgb,var(--_accent) 9%,transparent)}
+.ground{margin-top:1.25rem;padding:.75rem;border-radius:8px;font-size:.875rem;background:rgba(103,80,164,.08);background:color-mix(in srgb,var(--_accent) 9%,transparent)}
+.ground+.ground{margin-top:.75rem}
+.ground p{margin:0 0 .5rem}
+.ground label{display:flex;align-items:flex-start;gap:.5rem;cursor:pointer}
+.ground input[type=checkbox]{accent-color:var(--_accent);margin-top:2px;flex:none}
+.ground .elev{display:flex;align-items:center;gap:.5rem;margin-top:.5rem}
+.ground .elev input{width:6rem;height:40px;box-sizing:border-box;padding:0 10px;font:inherit;color:var(--_fg);
+  background:transparent;border:1px solid var(--_outline);border-radius:4px;outline:none}
+.ground .elev input:focus{border-color:var(--_accent);box-shadow:0 0 0 1px var(--_accent)}
+.ground .arrival{margin-top:.5rem;color:var(--_muted)}
 .preset b{font-weight:500;color:var(--_fg)}
 /* ---- buttons ---- */
 .btn{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;box-sizing:border-box;height:40px;margin:1.5rem 0 0;
@@ -1248,6 +1396,151 @@ progress{width:100%;height:4px;margin-top:.5rem;accent-color:var(--_accent)}
         el.appendChild(document.createTextNode(items.map(([k, lbl]) => this.t(lbl) + ' ' + this._locked[k]).join(' \u00b7 ')));
       }
 
+      // ---------------- ground elevation: scale-bug warning and the field-elevation picker ----------------
+      // Both read the same preview of the loaded file (this._preview) and neither ever changes the actual
+      // conversion by itself - each is a suggestion the user confirms (a checkbox, a typed number), same
+      // "suggest, don't auto-apply" rule the rest of the hidden settings follow.
+
+      /** Reads the file, checks it for the x10 elevation-scale bug, and finds where it touches the ground. */
+      async previewFile(file) {
+        let text;
+        try { text = await this.readText(file); } catch (_) { return; }
+        if (this._file !== file) return;                    // a newer file arrived while this one was still reading
+        let pts;
+        try { ({ pts } = parseGpx(text)); } catch (_) { this._preview = null; this.renderGround(); return; }
+        this._preview = {
+          text, elevationScaleSuspect: elevationLooksScaled(pts), scaleConfirmed: false, fieldFt: '', fieldSource: null, groundStretches: [],
+          lookupStatus: 'idle', lookupResultFt: null,
+        };
+        this.refreshPreview();
+        // Automatic, not opt-in: every real track has a ground stretch, so this fires for nearly every file
+        // loaded - a bigger claim on "nothing leaves your browser" than an opt-in click would be, which is why
+        // it is disclosed up front in the README rather than only noted where the field itself appears.
+        if (this._preview.groundStretches.length) this.lookupGroundElevation();
+      }
+
+      /** Re-runs the (cheap, systems-off) preview conversion - needed whenever the confirmed scale changes, since
+       *  the ground elevation shown depends on it. */
+      refreshPreview() {
+        const p = this._preview;
+        if (!p) { this.renderGround(); return; }
+        try {
+          const { info } = convert(p.text, {
+            systems: 'off', hz: Number(this._fixed.hz), smoothPosS: Number(this._fixed.smoothPos),
+            elevationScale: p.scaleConfirmed ? 10 : 1,
+          });
+          p.groundStretches = info.groundStretches;
+        } catch (_) { p.groundStretches = []; }
+        this.renderGround();
+      }
+
+      /** Runs automatically once a loaded file's ground stretches are known (see previewFile), and again from
+       *  the "Look up again" link on failure or once the field has been hand-edited. One lookup decides the
+       *  scale checkbox (if that warning is showing) and fills the field-elevation input, both from the same
+       *  result - never overriding a value the user has since typed themselves (see fieldSource below). */
+      async lookupGroundElevation() {
+        const p = this._preview;
+        if (!p || !p.groundStretches.length) return;
+        const dep = p.groundStretches[0];
+        p.lookupStatus = 'checking';
+        this.renderGround();
+        const m = await lookupElevation(dep.lat, dep.lon);
+        if (this._preview !== p) return;                    // a different file loaded while this was in flight
+        if (m === null) { p.lookupStatus = 'error'; this.renderGround(); return; }
+        p.lookupStatus = 'done';
+        p.lookupResultFt = Math.round(m / 0.3048);
+        // Only overwrite the field if it is still whatever the lookup itself last put there (or empty) - once
+        // the user has typed their own value, a later automatic re-check (e.g. after the scale checkbox flips
+        // and recomputes groundStretches) must not silently replace it.
+        if (p.fieldSource !== 'manual') { p.fieldFt = String(p.lookupResultFt); p.fieldSource = 'lookup'; }
+        this.staleResult();
+        if (p.elevationScaleSuspect) {
+          // compares against the RAW elevation regardless of the checkbox's current state, so this gives the
+          // same answer whether or not the checkbox happened to be ticked already
+          const rawM = p.scaleConfirmed ? dep.elevM / 10 : dep.elevM;
+          const wantScale = Math.abs(m - rawM * 10) < Math.abs(m - rawM);
+          if (wantScale !== p.scaleConfirmed) { p.scaleConfirmed = wantScale; this.refreshPreview(); return; }
+        }
+        this.renderGround();
+      }
+
+      renderGround() {
+        const el = this.$('ground');
+        if (!el) return;
+        const p = this._preview;
+        el.hidden = !p || (!p.elevationScaleSuspect && p.groundStretches.length === 0);
+        el.textContent = '';
+        if (!p) return;
+
+        if (p.elevationScaleSuspect) {
+          const box = document.createElement('div');
+          box.className = 'ground';
+          const msg = document.createElement('p');
+          msg.textContent = this.t('warn.elevationScale');
+          const label = document.createElement('label');
+          const cb = document.createElement('input');
+          cb.type = 'checkbox'; cb.checked = p.scaleConfirmed;
+          cb.addEventListener('change', () => { p.scaleConfirmed = cb.checked; this.refreshPreview(); this.staleResult(); });
+          const span = document.createElement('span');
+          span.textContent = this.t('btn.applyElevationScale');
+          label.append(cb, span);
+          box.append(msg, label);
+          el.appendChild(box);
+        }
+
+        if (p.groundStretches.length > 0) {
+          const box = document.createElement('div');
+          box.className = 'ground';
+          const dep = p.groundStretches[0], depFt = dep.elevM / 0.3048;
+          const msg = document.createElement('p');
+          msg.textContent = this.t('field.fieldElev', { lat: dep.lat.toFixed(4), lon: dep.lon.toFixed(4), gpxFt: Math.round(depFt) });
+          const row = document.createElement('div');
+          row.className = 'elev';
+          const input = document.createElement('input');
+          input.type = 'text'; input.inputMode = 'decimal'; input.autocomplete = 'off'; input.id = 'field-elev';
+          input.value = p.fieldFt;
+          input.placeholder = this.t('field.fieldElevPlaceholder');
+          const unit = document.createElement('span');
+          unit.textContent = this.t('unit.ft');
+          row.append(input, unit);
+          box.append(msg, row);
+
+          // One line under the field: what is happening (checking), where the current value came from (source),
+          // or why nothing is there (error) - plus a small "look up again" link, always available so a failed or
+          // superseded-by-typing lookup can be retried without reloading the file. A stable pair of elements
+          // updated in place by reference (updateStatus), not rebuilt - the input's own handler calls it on every
+          // keystroke, and rebuilding the DOM there would drop focus and the cursor position mid-word.
+          const status = document.createElement('p');
+          status.className = 'arrival';
+          const src = document.createElement('span');
+          const again = document.createElement('button');
+          again.type = 'button'; again.className = 'text'; again.style.padding = '0';
+          again.textContent = this.t('btn.lookupAgain');
+          again.addEventListener('click', () => { p.fieldSource = null; this.lookupGroundElevation(); });
+          status.append(src, again);
+          box.appendChild(status);
+          const updateStatus = () => {
+            if (p.lookupStatus === 'checking') { src.textContent = this.t('status.checkingElevation') + ' '; again.hidden = true; return; }
+            again.hidden = false;
+            if (p.lookupStatus === 'error') src.textContent = this.t('err.elevationLookup') + ' ';
+            else if (p.fieldSource === 'lookup') src.textContent = this.t('hint.fieldSourceLookup', { ft: p.lookupResultFt }) + ' ';
+            else if (p.fieldSource === 'manual') src.textContent = this.t('hint.fieldSourceManual') + ' ';
+            else src.textContent = '';
+          };
+          updateStatus();
+          input.addEventListener('input', () => { p.fieldFt = input.value; p.fieldSource = 'manual'; this.staleResult(); updateStatus(); });
+
+          if (p.groundStretches.length > 1) {
+            const arr = p.groundStretches[p.groundStretches.length - 1];
+            const note = document.createElement('p');
+            note.className = 'arrival';
+            note.textContent = this.t('hint.arrivalElev', { lat: arr.lat.toFixed(4), lon: arr.lon.toFixed(4), gpxFt: Math.round(arr.elevM / 0.3048) });
+            box.appendChild(note);
+          }
+          el.appendChild(box);
+        }
+      }
+
       // ---------------- lifecycle ----------------
       connectedCallback() {
         if (this._ready) return;
@@ -1301,6 +1594,7 @@ progress{width:100%;height:4px;margin-top:.5rem;accent-color:var(--_accent)}
           +   '<button type="button" class="btn tonal pick" id="pick">' + ICON.upload + '<span id="pick-label"></span></button>'
           + '</div>'
           + '<p class="preset" id="preset" hidden></p>'
+          + '<div id="ground" hidden></div>'
           + text('icaoType', { name: 'icao', hint: true, max: 4, uc: true })
           + text('callsign', { name: 'callsign', hint: true, max: 16 })
           + text('model', { name: 'model', hint: true, max: 128 })
@@ -1313,6 +1607,7 @@ progress{width:100%;height:4px;margin-top:.5rem;accent-color:var(--_accent)}
             + '<button class="text" id="reset" type="button" data-i18n="btn.reset"></button></div>' : '')
           + '</div>';
         this._file = null;
+        this._preview = null;
         this._over = false;
         const input = this.$('file'), drop = this.$('drop');
         input.addEventListener('change', () => { const f = input.files[0]; input.value = ''; if (f) this.loadFile(f); });
@@ -1397,17 +1692,28 @@ progress{width:100%;height:4px;margin-top:.5rem;accent-color:var(--_accent)}
         out.appendChild(d);
       }
 
+      /** A setting changed since the last conversion, so any result shown is no longer what pressing Convert
+       *  would produce - the scale checkbox and the field-elevation input use this too, same as every input/select. */
+      staleResult() {
+        if (this._hasResult) { this.$('out').textContent = ''; this._hasResult = false; }
+      }
+
       /** Load a File object (also used by the picker and drop). Returns false if it was rejected. */
       loadFile(file) {
         if (!file) return false;
         if (this._abort) { this._abort.abort(); this._abort = null; }   // a new file cancels a running conversion
         this._hasResult = false;
+        this._preview = null; this.renderGround();                      // a new file invalidates any earlier preview
         if (!/\.(gpx|xml)$/i.test(file.name)) { this.showError(this.t('file.notGpx')); return false; }
         if (file.size > MAX_MB * 1048576) { this.showError(this.t('file.tooLarge', { max: MAX_MB })); return false; }
         this._file = file;
         this.$('out').textContent = '';
         this.$('go').disabled = false;
         this.updateDrop();
+        // Not awaited: the scale-bug check and the field-elevation picker are opt-in conveniences for a person
+        // looking at the page, not something auto-convert (a fully preset page, meant to need no interaction at
+        // all) should ever wait on - it can run and finish before this preview does.
+        this.previewFile(file);
         if (this._auto) this.run();
         return true;
       }
@@ -1441,6 +1747,12 @@ progress{width:100%;height:4px;margin-top:.5rem;accent-color:var(--_accent)}
         if (!this._file) return;
         if (!this.validate()) { this.showError(this.t('err.icaoInvalid')); return; }
         const file = this._file, d = this._defaults, v = this.readValues();
+        // The scale-bug checkbox and the field-elevation input are suggestions the user confirmed for this file,
+        // so they win over the elevation-scale / altitude-offset attributes or URL parameters when present.
+        const pv = this._preview;
+        const elevationScale = pv && pv.scaleConfirmed ? 10 : Number(this._fixed.elevationScale);
+        const fieldFt = pv && pv.groundStretches.length ? parseFloat(pv.fieldFt) : NaN;
+        const altitudeOffsetM = !Number.isNaN(fieldFt) ? fieldFt * 0.3048 - pv.groundStretches[0].elevM : Number(this._fixed.altitudeOffset);
         const abort = new AbortController();
         this._abort = abort;
         this._hasResult = false;
@@ -1469,9 +1781,11 @@ progress{width:100%;height:4px;margin-top:.5rem;accent-color:var(--_accent)}
             fs2024: v.build === 'fs2024',
             systems: this._fixed.systems,
             hz: Number(this._fixed.hz),
-            altitudeOffsetM: Number(this._fixed.altitudeOffset),
+            elevationScale,
+            altitudeOffsetM,
             smoothPosS: Number(this._fixed.smoothPos),
             groundClearanceM: this._fixed.groundClearance === 'none' ? null : Number(this._fixed.groundClearance),
+            controls: this._fixed.controls,
             ...this.flapOptions(),
           }, { signal: abort.signal, onProgress: (f) => { prog.value = f; } });
           const stem = file.name.replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60) || 'recording';

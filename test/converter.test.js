@@ -57,6 +57,19 @@ test('GPX parsing', async (t) => {
   await t.test('very large tracks are refused', () => {
     assert.throws(() => J.convert(toGpx(patternFlight()), { maxPoints: 100 }, QuietParser), (e) => e.code === 'tooLarge' && e.params.limit === 100);
   });
+  await t.test('elevationLooksScaled: flags a track whose altitude lost a digit, not a real one', () => {
+    // 30 points, every value an exact multiple of 0.1, 8.7 m of range - exactly the shape seen from an
+    // IGC->GPX conversion that wrote real terrain heights at a tenth of their size
+    const scaled = Array.from({ length: 30 }, (_, i) => ({ ele: 60 + i * 0.3 }));
+    assert.equal(J.elevationLooksScaled(scaled), true);
+    assert.equal(J.elevationLooksScaled(scaled.slice(0, 15)), false, 'too few points to be sure');
+    assert.equal(J.elevationLooksScaled(scaled.map((p) => ({ ele: 60 }))), false, 'no vertical movement at all');
+    // a real, unscaled altitude track essentially never lands on exact tenths - the noiseless fixture used
+    // elsewhere in this suite is *not* a fair negative here, its altitude is deterministic tenths-arithmetic
+    // (vz integrated a second at a time) and happens to satisfy the same test the bug's fingerprint does
+    const { pts } = J.parseGpx(toGpx(patternFlight({ noise: 0.6, seed: 42 })), QuietParser);
+    assert.equal(J.elevationLooksScaled(pts), false);
+  });
 });
 
 test('file layout', async (t) => {
@@ -86,16 +99,19 @@ test('file layout', async (t) => {
       assert.equal(d.aircraft[0].icaoType, undefined);
     }
   });
-  await t.test('version 21008 carries the static-CG field, unknown by default', () => {
-    // NaN, not 0: a GPX cannot say how far the recorded aircraft's datum sat above its wheels, and JoinFS reads
-    // a declared 0 as "sits flush on the ground" and adds the substitute model's whole clearance on top of every
-    // altitude - which is its documented "hovers meters above the ground" bug. Unknown makes it skip that.
+  await t.test('version 21008 carries the static-CG field, contact point by default', () => {
+    // 0 says "the altitude written is where the wheels touch", which the on-ground clamp makes true, and JoinFS
+    // answers by adding the spawned model's own clearance so that model sits on the terrain whatever its size.
     const d = decode(conv(pts, { ...base, jfsVersion: 21008 }).data);
     assert.ok(d.complete);
-    assert.ok(Number.isNaN(d.aircraft[0].positions[0].staticCgToGround));
+    assert.equal(d.aircraft[0].positions[0].staticCgToGround, 0);
 
     const m = decode(conv(pts, { ...base, jfsVersion: 21008, groundClearanceM: 1.2 }).data);
     assert.ok(Math.abs(m.aircraft[0].positions[0].staticCgToGround * 0.3048 - 1.2) < 1e-4, 'metres are written as feet');
+
+    // null = unknown: JoinFS then makes no ground-clearance correction at all
+    const u = decode(conv(pts, { ...base, jfsVersion: 21008, groundClearanceM: null }).data);
+    assert.ok(Number.isNaN(u.aircraft[0].positions[0].staticCgToGround));
 
     assert.equal(decode(conv(pts, { ...base, jfsVersion: 21005 }).data).aircraft[0].positions[0].staticCgToGround, undefined,
       'older layouts have no such field');
@@ -175,6 +191,17 @@ test('motion and attitude', async (t) => {
       const p = src[k];
       const d = dist({ lat: deg(f.lat), lon: deg(f.lon) }, p);
       assert.ok(d < 1.5 && Math.abs(f.alt - p.ele) < 0.5, `point ${k}: ${d.toFixed(2)} m off`);
+    }
+  });
+  await t.test('elevationScale multiplies every altitude before altitudeOffsetM shifts it', () => {
+    // mid-cruise only: the on-ground clamp is a max(), not a pure linear operation, so it is not guaranteed to
+    // scale exactly - this only claims the airborne portion of the track, which is the point of the option.
+    const plain = mid(fly([{ dur: 20, v: 0 }, { dur: 200, v: 60, acc: 5, vz: 4 }], {}));
+    const doubled = mid(decode(conv(simulate([{ dur: 20, v: 0 }, { dur: 200, v: 60, acc: 5, vz: 4 }]), { ...OFF, elevationScale: 2 }).data).aircraft[0].positions);
+    const both = mid(decode(conv(simulate([{ dur: 20, v: 0 }, { dur: 200, v: 60, acc: 5, vz: 4 }]), { ...OFF, elevationScale: 2, altitudeOffsetM: 100 }).data).aircraft[0].positions);
+    for (let i = 0; i < plain.length; i += 37) {
+      assert.ok(Math.abs(doubled[i].alt - plain[i].alt * 2) < 1e-6, `x2 at ${i}: ${doubled[i].alt} vs ${plain[i].alt * 2}`);
+      assert.ok(Math.abs(both[i].alt - (plain[i].alt * 2 + 100)) < 1e-6, `x2 then +100 at ${i}`);
     }
   });
 });
@@ -325,6 +352,52 @@ test('gear, flaps and lights', async (t) => {
     assert.ok(Math.abs((nmAtGear - nmAtFull) - 1) < 0.2, 'gear 1 nm before the flaps: ' + (nmAtGear - nmAtFull).toFixed(2));
   });
 
+  await t.test('an aircraft on the ground is never written below the ground', () => {
+    // The vertical noise of a real track dips below the field for a third of the on-ground samples. An altitude
+    // commanded under the simulator's terrain sets its own penetration correction fighting ours every tick, seen
+    // as the aircraft shivering while parked and through the takeoff roll - so the on-ground altitude is clamped
+    // to the field reference. Noisy track: the clean fixtures have nothing to clamp.
+    const pos = decode(conv(patternFlight({ noise: 0.8, seed: 11 }), OFF).data).aircraft[0].positions;
+    const down = pos.filter((f) => f.ground);
+    assert.ok(down.length > 50, 'the fixture has a ground phase: ' + down.length);
+    // 1 cm covers the float32 rounding of the written GROUND ALTITUDE field; real penetration was ~2 m
+    const worst = Math.min(...down.map((f) => f.alt - f.elevation));
+    assert.ok(worst > -0.01, 'deepest on-ground excursion below the reference: ' + worst.toExponential(2) + ' m');
+
+    // and the clamp must not flatten the rotation: the climb through the last on-ground samples into the first
+    // airborne ones stays monotonic, with no step at the hand-over
+    let lift = -1;
+    for (let i = 1; i < pos.length; i++) if (pos[i - 1].ground && !pos[i].ground) { lift = i; break; }
+    assert.ok(lift > 0, 'the fixture lifts off');
+    for (let i = lift - 4; i <= lift + 4; i++) {
+      assert.ok(pos[i].alt >= pos[i - 1].alt - 1e-9, 'altitude never drops across the ground/air hand-over');
+    }
+  });
+
+  await t.test('control surfaces: neutral by default, derived from the manoeuvre on request', () => {
+    const pts = patternFlight();
+    const off = decode(conv(pts, OFF).data).aircraft[0].positions;
+    assert.ok(off.every((f) => f.controls.every((c) => c === 0)), 'default writes every surface neutral');
+
+    const on = decode(conv(pts, { ...OFF, controls: 'derived' }).data).aircraft[0].positions;
+    // never on the ground: JoinFS feeds these to the simulator, where rudder drives nosewheel steering
+    assert.ok(on.filter((f) => f.ground).every((f) => f.controls.every((c) => c === 0)), 'neutral while on the ground');
+    // brakes are not inferred at all
+    assert.ok(on.every((f) => f.controls[3] === 0 && f.controls[4] === 0), 'brakes stay neutral');
+    assert.ok(on.every((f) => f.controls.every((c) => Math.abs(c) <= 1)), 'within full scale');
+    const air = on.filter((f) => !f.ground);
+    assert.ok(Math.max(...air.map((f) => Math.abs(f.controls[2]))) > 0.02, 'aileron actually moves in the air');
+
+    // a deflection commands a rate, so the aileron reverses between rolling into a turn and rolling out of it
+    let rollIn = 0, rollOut = 0;
+    for (let i = 1; i < on.length; i++) {
+      const d = on[i].bank - on[i - 1].bank;
+      if (d < -1e-4) rollIn = on[i].controls[2];
+      else if (d > 1e-4 && rollIn !== 0) { rollOut = on[i].controls[2]; break; }
+    }
+    assert.ok(rollIn * rollOut < 0, `aileron reverses on roll-out (in ${rollIn.toFixed(3)}, out ${rollOut.toFixed(3)})`);
+  });
+
   await t.test('a track that starts and ends airborne: gear up, flaps 0, strobe on, no landing events', () => {
     const pts = Array.from({ length: 600 }, (_, i) => ({ t: 1.8e9 + i, lat: 50 + i * 50 / 111194.9, lon: 10, ele: 1500 + 100 * Math.sin(i / 60) }));
     const { info, a } = run(pts);
@@ -364,7 +437,7 @@ test('gear, flaps and lights', async (t) => {
   });
 });
 
-const SNAPSHOT_SHA256 = '4a1dc1b21d62d3f6129b19e7e3085ad82102c28435f9caa474abca565d874faa';
+const SNAPSHOT_SHA256 = '49e144fe78eaeef959aa2468be0d8549effc43925b8b56b964ee9ea7142d1334';
 
 test('asynchronous conversion (worker path)', async (t) => {
   const text = toGpx(patternFlight());

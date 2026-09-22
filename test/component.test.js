@@ -384,6 +384,167 @@ test('altitude offset: shifts the whole track without disturbing ground detectio
   }
 });
 
+// 30 points, every value an exact multiple of 0.1, 8.7 m of range - the shape J.elevationLooksScaled looks for.
+const scaledGpx = toGpx(Array.from({ length: 30 }, (_, i) => ({ t: 1.8e9 + i, lat: 50 + i * 0.0001, lon: 10, ele: 60 + i * 0.3 })));
+
+// Clicks the already-visible Go button and waits for the result, without loadFile()'s own reload - which would
+// wipe out whatever preview state (a confirmed checkbox, a typed elevation) the test just set up.
+async function clickGo(w, el) {
+  let detail = null;
+  el.addEventListener('converted', (e) => { detail = e.detail; }, { once: true });
+  $(el, 'go').click();
+  await waitFor(() => detail);
+  return detail;
+}
+
+test('elevation-scale warning: detected on load, never applied without the checkbox', async () => {
+  const m = mount(`<${TAG}></${TAG}>`); const el = m.el();
+  el.loadFile(file(m.w, 'scaled.gpx', scaledGpx));
+  await waitFor(() => !hidden(el, 'ground'));
+  const cb = el.shadowRoot.querySelector('#ground input[type=checkbox]');
+  assert.ok(cb && !cb.checked, 'flagged, but unconfirmed by default');
+  typeInto(m.w, el, 'callsign', 'X');
+
+  const plainExpected = J.convert(scaledGpx, { callsign: 'X' }, QuietParser).data;
+  let d = await clickGo(m.w, el);
+  assert.ok(same(await blobBytes(m.w, d.blob), plainExpected), 'unconfirmed: scale is not applied');
+
+  cb.click();
+  assert.ok(cb.checked, 'the click itself is synchronous');
+  d = await clickGo(m.w, el);
+  const scaledExpected = J.convert(scaledGpx, { callsign: 'X', elevationScale: 10 }, QuietParser).data;
+  assert.ok(same(await blobBytes(m.w, d.blob), scaledExpected), 'confirmed: x10 is applied');
+  assert.ok(!same(await blobBytes(m.w, d.blob), plainExpected), 'and it is a real difference');
+
+  // a normal, noisy track never triggers the warning - GPX (the default file() fixture) is not a fair check
+  // here, its altitude is deterministic tenths-arithmetic (see the core-level test of the same name) and would
+  // trigger the same test the bug's fingerprint does
+  const m2 = mount(`<${TAG}></${TAG}>`); const el2 = m2.el();
+  el2.loadFile(file(m2.w, 'noisy.gpx', toGpx(patternFlight({ noise: 0.6, seed: 42 }))));
+  await sleep(50);
+  assert.ok(hidden(el2, 'ground') || !el2.shadowRoot.querySelector('#ground input[type=checkbox]'), 'no warning for a normal track');
+});
+
+test('field-elevation picker: surfaces ground stretches, computes altitude-offset from what is entered', async () => {
+  let m = mount(`<${TAG}></${TAG}>`); let el = m.el();
+  assert.equal($(el, 'field-elev'), null, 'no picker before a file is loaded');
+  el.loadFile(file(m.w));
+  await waitFor(() => !hidden(el, 'ground'));
+  const input = el.shadowRoot.querySelector('#field-elev');
+  assert.ok(input, 'the departure stretch got an input');
+  assert.equal(input.value, '', 'empty until the user types');
+
+  const plain = decode(core({}).data, { fs2024: true }).aircraft[0].positions;
+  const depFt = Math.round(plain[0].elevation / 0.3048);
+  input.value = String(depFt + 100); input.dispatchEvent(ev(m.w, 'input'));
+  typeInto(m.w, el, 'callsign', 'X');
+  const d = await clickGo(m.w, el);
+  const offsetM = (depFt + 100) * 0.3048 - plain[0].elevation;
+  assert.ok(same(await blobBytes(m.w, d.blob), core({ callsign: 'X', altitudeOffsetM: offsetM }).data),
+    'the entered elevation, converted to an altitude-offset, reaches the converter');
+
+  // blank input: no correction, same as never having opened the picker
+  m = mount(`<${TAG}></${TAG}>`); el = m.el();
+  el.loadFile(file(m.w));
+  await waitFor(() => !hidden(el, 'ground'));
+  typeInto(m.w, el, 'callsign', 'X');
+  const d2 = await clickGo(m.w, el);
+  assert.ok(same(await blobBytes(m.w, d2.blob), core({ callsign: 'X' }).data), 'left blank, nothing changes');
+});
+
+// Wires w.fetch so a request to Open-Meteo returns a fixed elevation (metres), or fails if elevationM is null,
+// while any other URL (locale files) keeps working exactly as mount() already set it up.
+function mockElevation(w, elevationM) {
+  const orig = w.fetch;
+  w.fetch = async (u) => {
+    if (String(u).includes('open-meteo.com')) {
+      return elevationM === null ? { ok: false, status: 500, text: async () => 'nope' }
+        : { ok: true, status: 200, text: async () => JSON.stringify({ elevation: [elevationM] }) };
+    }
+    return orig(u);
+  };
+}
+
+test('"Look up online": one click sets the scale checkbox and fills the field-elevation input', async () => {
+  // scaledGpx's departure is ~60.84 m raw / ~608.4 m x10 - mock a result close to the raw one
+  let m = mount(`<${TAG}></${TAG}>`); let el = m.el();
+  el.loadFile(file(m.w, 'scaled.gpx', scaledGpx));
+  await waitFor(() => !hidden(el, 'ground'));
+  assert.equal(m.calls.length, 0, 'no network call from loading the file alone');
+  mockElevation(m.w, 61);
+  let btn = [...el.shadowRoot.querySelectorAll('#ground button')].find((b) => b.textContent === 'Look up online');
+  assert.ok(btn, 'the button is there');
+  btn.click();
+  await waitFor(() => el.shadowRoot.querySelector('#field-elev').value !== '');
+  assert.equal(el.shadowRoot.querySelector('#field-elev').value, '200', 'field filled from the lookup, in feet');
+  let cb = el.shadowRoot.querySelector('#ground input[type=checkbox]');
+  assert.ok(!cb.checked, 'raw is the closer match, so the checkbox is not ticked');
+  assert.match(el.shadowRoot.getElementById('ground').textContent, /200 ft/);
+
+  // same file, a result close to the x10 value instead
+  m = mount(`<${TAG}></${TAG}>`); el = m.el();
+  el.loadFile(file(m.w, 'scaled.gpx', scaledGpx));
+  await waitFor(() => !hidden(el, 'ground'));
+  mockElevation(m.w, 610);
+  btn = [...el.shadowRoot.querySelectorAll('#ground button')].find((b) => b.textContent === 'Look up online');
+  btn.click();
+  await waitFor(() => el.shadowRoot.querySelector('#field-elev').value !== '');
+  assert.equal(el.shadowRoot.querySelector('#field-elev').value, '2001');
+  cb = el.shadowRoot.querySelector('#ground input[type=checkbox]');
+  assert.ok(cb.checked, 'x10 is the closer match, so the checkbox is ticked');
+  typeInto(m.w, el, 'callsign', 'X');
+  const d = await clickGo(m.w, el);
+  // the field round-trips the lookup through whole feet, same as a person reading a dialog would, so it is not
+  // exactly the raw 610 m looked up - the residual is the altitude-offset this produces, same as any other
+  // field-elevation entry
+  const scaledElevM = 60.84000000000001 * 10;
+  const offsetM = 2001 * 0.3048 - scaledElevM;
+  assert.ok(same(await blobBytes(m.w, d.blob), core({ callsign: 'X', elevationScale: 10, altitudeOffsetM: offsetM }).data),
+    'and the scale, plus the small feet-rounding residual, reaches the converter');
+});
+
+test('"Look up online" also works for a normal track, with no checkbox involved', async () => {
+  const m = mount(`<${TAG}></${TAG}>`); const el = m.el();
+  el.loadFile(file(m.w));                                    // GPX: departure is 320 m = 1049.9 ft
+  await waitFor(() => !hidden(el, 'ground'));
+  assert.equal(el.shadowRoot.querySelector('#ground input[type=checkbox]'), null, 'no scale warning for this track');
+  mockElevation(m.w, 300);
+  const btn = [...el.shadowRoot.querySelectorAll('#ground button')].find((b) => b.textContent === 'Look up online');
+  btn.click();
+  await waitFor(() => el.shadowRoot.querySelector('#field-elev').value !== '');
+  assert.equal(el.shadowRoot.querySelector('#field-elev').value, '984');
+  typeInto(m.w, el, 'callsign', 'X');
+  const d = await clickGo(m.w, el);
+  // rounded through whole feet first, same as the field-elevation picker always does - not exactly the raw 300 m
+  const offsetM = 984 * 0.3048 - 320;
+  assert.ok(same(await blobBytes(m.w, d.blob), core({ callsign: 'X', altitudeOffsetM: offsetM }).data));
+});
+
+test('"Look up online": a failed lookup leaves everything untouched and says so', async () => {
+  const m = mount(`<${TAG}></${TAG}>`); const el = m.el();
+  el.loadFile(file(m.w));
+  await waitFor(() => !hidden(el, 'ground'));
+  const input = el.shadowRoot.querySelector('#field-elev');
+  input.value = '500'; input.dispatchEvent(ev(m.w, 'input'));
+  mockElevation(m.w, null);
+  const btn = [...el.shadowRoot.querySelectorAll('#ground button')].find((b) => b.textContent === 'Look up online');
+  btn.click();
+  await waitFor(() => /Couldn.t look that up/.test(el.shadowRoot.getElementById('ground').textContent));
+  assert.equal(el.shadowRoot.querySelector('#field-elev').value, '500', 'the typed value survives a failed lookup');
+});
+
+test('"Look up online": overwrites whatever was already typed', async () => {
+  const m = mount(`<${TAG}></${TAG}>`); const el = m.el();
+  el.loadFile(file(m.w));
+  await waitFor(() => !hidden(el, 'ground'));
+  const input = el.shadowRoot.querySelector('#field-elev');
+  input.value = '1'; input.dispatchEvent(ev(m.w, 'input'));
+  mockElevation(m.w, 300);
+  const btn = [...el.shadowRoot.querySelectorAll('#ground button')].find((b) => b.textContent === 'Look up online');
+  btn.click();
+  await waitFor(() => el.shadowRoot.querySelector('#field-elev').value === '984');
+});
+
 test('position smoothing and ground clearance reach the converter', async () => {
   let m = mount(`<${TAG}></${TAG}>`); let el = m.el();
   assert.equal($(el, 'smooth-pos'), null, 'neither adds a field');
