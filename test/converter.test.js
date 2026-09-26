@@ -165,6 +165,22 @@ test('motion and attitude', async (t) => {
     assert.ok(left.every((f) => Math.abs(f.bank - want) < 0.04), `left bank ${deg(left[0].bank)} vs ${deg(want)}`);
     assert.ok(right.every((f) => Math.abs(f.bank + want) < 0.04), `right bank ${deg(right[0].bank)}`);
   });
+  await t.test('angular velocity: heading rate matches the commanded turn rate, pitch/bank rates settle near zero', () => {
+    // angVel is [pitch-rate, heading-rate, bank-rate] rad/s (see the comment above angVelPitch in derive()).
+    // Without this JoinFS's own playback has nothing to advance attitude by between its periodic updates, so
+    // it freezes and then snaps - very visible in a sustained turn, which is exactly the case checked here.
+    const wantRate = -3 * Math.PI / 180;
+    const left = mid(fly([{ dur: 20, v: 0 }, { dur: 30, v: 60, acc: 5, vz: 4 }, { dur: 120, v: 60, turn: -3, vz: 4 }]).slice(40));
+    for (const f of left) {
+      assert.ok(Math.abs(f.angVel[1] - wantRate) < 0.01, `heading rate ${f.angVel[1]} vs ${wantRate}`);
+      assert.ok(Math.abs(f.angVel[0]) < 0.01, `pitch rate ${f.angVel[0]} should be ~0 in a steady turn`);
+      assert.ok(Math.abs(f.angVel[2]) < 0.01, `bank rate ${f.angVel[2]} should be ~0 once the turn is established`);
+    }
+  });
+  await t.test('angular velocity is near zero in straight, wings-level flight', () => {
+    const pos = mid(fly([{ dur: 20, v: 0 }, { dur: 200, v: 60, acc: 5, vz: 4 }]));
+    assert.ok(pos.every((f) => f.angVel.every((v) => Math.abs(v) < 0.01)), 'angVel ~0 in cruise');
+  });
   await t.test('bank is limited to 45 degrees', () => {
     const pos = fly([{ dur: 20, v: 0 }, { dur: 30, v: 80, acc: 5, vz: 4 }, { dur: 60, v: 80, turn: -20, vz: 4 }]);
     assert.ok(pos.every((f) => Math.abs(f.bank) <= Math.PI / 4 + 1e-6));
@@ -437,7 +453,7 @@ test('gear, flaps and lights', async (t) => {
   });
 });
 
-const SNAPSHOT_SHA256 = '49e144fe78eaeef959aa2468be0d8549effc43925b8b56b964ee9ea7142d1334';
+const SNAPSHOT_SHA256 = '4aa1a0b96e397c03c0cccdd949d6a2c73a1811c6e1eada3edaf990987aefaf4d';
 
 test('asynchronous conversion (worker path)', async (t) => {
   const text = toGpx(patternFlight());

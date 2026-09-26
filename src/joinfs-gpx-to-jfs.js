@@ -367,6 +367,14 @@
         bankOut[i] = -w * bankRight[i];
       }
 
+      // Angular velocity, written below instead of the zero JoinFS used to get: without it, JoinFS's own
+      // playback (Sim.cs, Pos.Extrapolate) has nothing to advance pitch/heading/bank by between the periodic
+      // updates it pulls from the interpolated track, so the attitude it sends to the simulator sits frozen
+      // and then snaps to the next update - repeatedly, since every update is another freeze-then-snap. That
+      // is invisible in cruise, where the true rate is near zero, and very visible in a sustained turn. Plain
+      // Euler-angle rates (d/dt of pitch, heading, bank), matching how JoinFS itself reads this field.
+      const angVelPitch = diff(pitchOut), angVelBank = diff(bankOut);
+
       // Control surfaces. Nothing in a GPX records them, so they are inferred from the manoeuvre the track
       // describes, and they are cosmetic: position and attitude are commanded directly, these only move the
       // surfaces. A deflection commands a *rate*, not an angle - so aileron follows the roll rate and is neutral
@@ -426,6 +434,7 @@
           t: t[i], lat: lat[i], lon: lon[i], alt: altOut,
           pitch: pitchOut[i], bank: bankOut[i], heading: pmod(heading[i], 2 * Math.PI),
           vE: vE[i], vU: vU[i], vN: vN[i], gs: gs[i], ground, elevation: ref,
+          angVelPitch: angVelPitch[i], angVelHeading: rate[i], angVelBank: angVelBank[i],
           rudder: surfaces[i].rudder, elevator: surfaces[i].elevator, aileron: surfaces[i].aileron,
         };
       }
@@ -480,7 +489,10 @@
         dv.setFloat64(p, s.lat, true); p += 8;
         dv.setFloat64(p, s.lon, true); p += 8;
         dv.setFloat64(p, s.alt, true); p += 8;
-        for (const f of [s.pitch, s.bank, s.heading, s.vE, s.vU, s.vN, 0, 0, 0, 0, 0, 0]) {
+        // angular velocity is X=pitch-rate, Y=heading-rate, Z=bank-rate (matches JoinFS's own Vector
+        // convention for angles, x=pitch/y=heading/z=bank - see the comment above angVelPitch) even though
+        // the PBH triple just before it is written pitch-bank-heading; do not transpose the two.
+        for (const f of [s.pitch, s.bank, s.heading, s.vE, s.vU, s.vN, s.angVelPitch, s.angVelHeading, s.angVelBank, 0, 0, 0]) {
           dv.setFloat32(p, f, true); p += 4;
         }
         // rudder, elevator, aileron, then both brakes - value * 16384, as a .NET BinaryWriter would

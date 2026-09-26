@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **The recording now writes real angular velocity** instead of always zero. JoinFS's own playback
+  (`Pos.Extrapolate` in `Sim.cs`) integrates this field to advance pitch/heading/bank in the gaps between the
+  periodic updates it pulls from the interpolated track; with it always zero, the attitude JoinFS sends to the
+  simulator sat frozen between updates and then snapped to the next one - repeatedly, which is why a sustained
+  turn (a glider thermalling, for example) showed the replayed aircraft's heading visibly hopping several
+  times a second instead of turning smoothly. Straight flight was largely unaffected, since the true rate
+  there is already near zero. This affects the written bytes; the converter snapshot hash was updated
+  accordingly.
+
 - **Field-elevation picker.** Once a GPX is loaded, the converter shows where it touches the ground (the same
   detection [Gear, flaps and lights](README.md#gear-flaps-and-lights) uses) alongside its own GPX-derived
   elevation there, with a field for the real figure read off JoinFS's Aircraft dialog after parking at that spot.
